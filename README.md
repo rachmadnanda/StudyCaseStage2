@@ -201,10 +201,10 @@ Serial Monitor akan menampilkan:
   CO-Zero v1.0 | Tim Iki jenenge wes wkwk
   Monitoring CO Kabin Mobil - SIC Batch 8
 ==============================================
-[DHT] Uji awal sensor (maksimum 3 percobaan)...
+[DHT] Uji awal sensor pada GPIO4 (maksimum 3 percobaan)...
 [DHT] Percobaan 1/3: OK -> 29.0 C, 61.0 %RH
 [CAL] Skala log: 0.6836 V/dekade, 1 ppm = 1.3629 V
-[CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht
+[CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht, scan
 [INFO] Kolom: CO=ppm i=instan raw=ADC V=volt d=DOUT
 [INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | AMAN->AMAN
 [WiFi] Menghubungkan ke Wokwi-GUEST ...
@@ -219,6 +219,17 @@ yang dipisahkan tanda `->`.
 
 Jika muncul `MQTT ... GAGAL`, periksa username dan password serta pastikan cluster aktif.
 Jika angka CO tidak sesuai dengan slider, lakukan kalibrasi pada bagian 7.
+
+Perintah Serial Monitor:
+
+| Perintah | Fungsi |
+|---|---|
+| `c1 <ppm>` | titik kalibrasi pertama pada konsentrasi gas acuan yang diketahui |
+| `c2 <ppm>` | titik kalibrasi kedua; kedua titik menentukan koefisien skala logaritmik |
+| `dht` | status iklim mikro, jumlah kegagalan berurutan, dan uji jalur data DHT22 |
+| `scan` | mencari pin tempat DHT22 benar-benar terpasang |
+| `r` | mengembalikan skala sensor ke nilai bawaan |
+| `?` | status kalibrasi beserta daftar perintah |
 
 ### 5.4 Dashboard
 
@@ -361,9 +372,15 @@ Alternatif lain adalah menghitung konstanta di luar simulasi dengan
 | `MQTT GAGAL (rc=-2)` | host/port salah atau TLS gagal | pastikan port **8883** dan host tanpa awalan `https://` |
 | `MQTT GAGAL (rc=4/5)` | username/password salah | buat ulang credential pada HiveMQ |
 | OLED blank | alamat I2C berbeda | ganti `0x3C` menjadi `0x3D` pada `oled.begin()` |
-| `[DHT] Percobaan 1/3: TIMEOUT` | jalur data DHT22 tidak merespons | periksa ketiga kabel pada `diagram.json`: `VCC→3V3`, `SDA→D4`, `GND→GND.1`; pastikan SDA tidak terpasang pada pad `NC` |
+| `[DHT] Percobaan 1/3: TIMEOUT` | jalur data DHT22 tidak merespons | firmware otomatis memindai pin lain; periksa juga ketiga kabel: `VCC→3V3`, `SDA→D4`, `GND→GND.1`, dan pastikan SDA tidak terpasang pada pad `NC` |
+| `[DHT] Sensor ditemukan pada GPIOxx dan dipakai` | kanvas Wokwi berbeda dari `diagram.json` | perangkat tetap berjalan; samakan `#define PIN_DHT` dengan nomor pin yang dilaporkan agar sesuai wiring |
+| `[DHT] Sensor tidak ditemukan pada pin mana pun` | tidak ada jalur data ke sensor | tempel ulang `diagram.json`, lalu **Stop → Start Simulation**; bila tetap gagal, sensor belum tersambung |
+| `[DHT] GPIOxx ditahan HIGH padahal pin acuan tidak` | jalur data menempel pada rel 3V3, bukan pada pin GPIO | pindahkan kabel `dht1:SDA` ke `esp:D4`; pad `VCC` tetap menuju `3V3` |
+| `[DHT] Probe GPIO4: ... acuan GPIO13: ...` | pin acuan tidak mengambang | simulator tidak menerapkan `INPUT_PULLDOWN`, sehingga probe tidak informatif; gunakan perintah `scan` |
+| `[DHT] GPIO data MENGAMBANG` | tidak ada komponen pada pin data | baris `dht1:SDA → esp:D4` belum ada pada `diagram.json` |
+| `[DHT] GPIO data tertahan LOW` | kabel data tertukar dengan GND | `dht1:SDA` salah menuju `GND.1`; arahkan ke `esp:D4` |
 | `[DHT] Gagal baca: CHECKSUM` | data terbalik saat transmisi | firmware mengulang otomatis setiap 2,2 detik; bila berlanjut, pindahkan `PIN_DHT` ke GPIO15 |
-| OLED menampilkan `--.-C  --%RH  NO DHT` | DHT22 tidak terbaca | klasifikasi iklim dilewati; periksa wiring lalu ketik `dht` untuk diagnostik |
+| OLED menampilkan `--.-C  --%RH  NO DHT` | DHT22 tidak terbaca | klasifikasi iklim dilewati; ketik `dht` untuk diagnostik atau `scan` untuk mencari pin sensor |
 | Angka ppm berubah cepat lalu diam | moving average sedang menyusul nilai lama | sudah ditangani `FAST_TRACK_PPM`; kolom `i=` pada Serial menunjukkan nilai sesaat |
 | Angka ppm beku (raw identik) padahal slider digeser | AOUT MQ-2 tidak tersambung ke GPIO34 | tempelkan ulang `diagram.json`, pastikan terdapat baris `[ "mq2:AOUT", "esp:D34", "green", [] ]`, lalu **Stop → Start Simulation** |
 | MQTT nonaktif tanpa pesan `GAGAL` | `MQTT_HOST` masih placeholder `xxxx…` | isi kredensial HiveMQ; firmware mengaktifkan MQTT secara otomatis |

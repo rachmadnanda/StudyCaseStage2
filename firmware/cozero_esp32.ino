@@ -67,6 +67,13 @@
 #define PIN_OLED_SDA    21
 #define PIN_OLED_SCL    22
 
+/*
+ * Pin kosong yang dipakai sebagai acuan diagnostik. Pin ini tidak terhubung ke
+ * komponen apa pun, sehingga perilakunya menunjukkan apakah simulator
+ * menerapkan resistor pull-down internal.
+ */
+#define REF_PROBE_PIN   13
+
 /* --- Ambang batas kadar CO (ppm) --- */
 #define TH_WASPADA      20
 #define TH_BAHAYA       35
@@ -199,6 +206,14 @@ float humPct        = 0.0f;
 bool  dhtOk         = false;
 unsigned long dhtOkAt   = 0;      // waktu pembacaan DHT terakhir yang valid
 unsigned int  dhtFail   = 0;      // jumlah kegagalan berurutan
+const char*   dhtLastErr = "-";   // status pembacaan terakhir (OK/TIMEOUT/CHECKSUM)
+
+/*
+ * Pin tempat DHT22 benar-benar terbaca. Nilainya sama dengan PIN_DHT kecuali
+ * pemindaian otomatis menemukan sensor pada pin lain, misalnya karena kanvas
+ * Wokwi berbeda dari diagram.json yang seharusnya dipakai.
+ */
+uint8_t dhtActivePin = PIN_DHT;
 
 /* state sistem */
 Level   coLevel     = LV_AMAN;    // level dari kadar CO saja (dengan histeresis)
@@ -284,7 +299,7 @@ void printCalState() {
   Serial.printf("  vAt1ppm    = %.4f V\n", vAt1ppm);
   Serial.printf("  Vout kini  = %.4f V -> %.1f ppm\n",
                 lastVoltOut, ppmAvg);
-  Serial.println(F("  Perintah: c1 <ppm> | c2 <ppm> | dht | r | ?"));
+  Serial.println(F("  Perintah: c1 <ppm> | c2 <ppm> | dht | scan | r | ?"));
 }
 
 /*
@@ -294,7 +309,10 @@ void printCalState() {
  */
 void printDhtState() {
   Serial.println(F("---- Status iklim mikro ----"));
-  Serial.printf("  DHT22      : %s\n", dhtOk ? "terbaca" : "TIDAK TERBACA");
+  Serial.printf("  DHT22      : %s (GPIO%d)\n",
+                dhtOk ? "terbaca" : "TIDAK TERBACA", dhtActivePin);
+  Serial.printf("  Status baca: %s (%u kegagalan berurutan)\n",
+                dhtLastErr, dhtFail);
   if (dhtOk) {
     Serial.printf("  Suhu       : %.1f C  (ambang panas >= %.1f C)\n",
                   tempC, TH_TEMP_PANAS);
@@ -302,6 +320,8 @@ void printDhtState() {
                   humPct, TH_RH_LEMBAB, TH_RH_KERING);
     Serial.printf("  Umur data  : %lu ms sejak pembacaan valid terakhir\n",
                   millis() - dhtOkAt);
+  } else {
+    dhtProbe();
   }
   Serial.printf("  Flag       : %s\n",
                 dhtOk ? ENV_NAME[envFlag] : "NORMAL (dilewati)");
@@ -642,6 +662,8 @@ void handleSerial() {
         printCalState();
       } else if (cmd == "dht") {
         printDhtState();
+      } else if (cmd == "scan") {
+        dhtScan(false);
       } else if (cmd == "r" || cmd == "reset") {
         vPerDecade = V_PER_DECADE_DEFAULT;
         vAt1ppm    = V_AT_1PPM_DEFAULT;
@@ -661,7 +683,7 @@ void handleSerial() {
         }
         if (!ok) {
           Serial.println(F("[CMD] Tidak dikenal. Gunakan: c1 <ppm> | c2 <ppm> "
-                           "| dht | r | ?"));
+                           "| dht | scan | r | ?"));
         }
       }
       continue;
@@ -763,6 +785,7 @@ void readDht() {
     tempC   = th.temperature;
     humPct  = th.humidity;
     dhtOkAt = millis();
+    dhtLastErr = "OK";
 
     if (!dhtOk) {
       if (dhtFail > 0) {
@@ -777,6 +800,7 @@ void readDht() {
 
   dhtOk = false;
   dhtFail++;
+  dhtLastErr = dht.getStatusString();
 
   /* Laporan dibatasi 5 detik sekali agar Serial Monitor tidak dipenuhi. */
   static unsigned long lastWarn = 0;
@@ -799,7 +823,8 @@ void readDht() {
  * kegagalan wiring langsung terlihat pada Serial Monitor.
  */
 void dhtSelfTest() {
-  Serial.printf("[DHT] Uji awal sensor (maksimum %d percobaan)...\n", DHT_BOOT_TRIES);
+  Serial.printf("[DHT] Uji awal sensor pada GPIO%d (maksimum %d percobaan)...\n",
+                dhtActivePin, DHT_BOOT_TRIES);
 
   for (int i = 1; i <= DHT_BOOT_TRIES; i++) {
     delay(2200);
@@ -810,19 +835,217 @@ void dhtSelfTest() {
       humPct  = th.humidity;
       dhtOk   = true;
       dhtOkAt = millis();
+      dhtLastErr = "OK";
       Serial.printf("[DHT] Percobaan %d/%d: OK -> %.1f C, %.1f %%RH\n",
                     i, DHT_BOOT_TRIES, tempC, humPct);
       return;
     }
+    dhtLastErr = dht.getStatusString();
     Serial.printf("[DHT] Percobaan %d/%d: %s\n",
-                  i, DHT_BOOT_TRIES, dht.getStatusString());
+                  i, DHT_BOOT_TRIES, dhtLastErr);
   }
 
   dhtOk = false;
-  Serial.println(F("[DHT] Sensor tidak merespons. Sistem tetap berjalan dengan "
+  Serial.printf("[DHT] GPIO%d tidak merespons. Mencari pin lain...\n", dhtActivePin);
+  dhtProbe();
+
+  /*
+   * Pemindaian otomatis: kanvas Wokwi dapat berbeda dari diagram.json yang
+   * seharusnya dipakai, sehingga sensor mungkin terpasang pada pin lain.
+   * Bila ditemukan, pin tersebut langsung dipakai agar sistem tetap
+   * memperoleh data iklim mikro tanpa perubahan kode.
+   */
+  int pin = dhtScan(true);
+  if (pin >= 0) {
+    Serial.printf("[DHT] Sensor ditemukan pada GPIO%d dan dipakai.\n", pin);
+    Serial.printf("[DHT] Ubah \"#define PIN_DHT %d\" agar sesuai wiring.\n", pin);
+    return;
+  }
+
+  Serial.println(F("[DHT] Sensor tidak ditemukan. Sistem tetap berjalan dengan "
                    "level CO saja."));
   Serial.printf("[DHT] Periksa wiring: VCC->3V3, SDA->D%d, GND->GND "
                 "(pad ketiga bertanda NC tidak terpakai).\n", PIN_DHT);
+}
+
+/*
+ * Uji tingkat tegangan sebuah pin.
+ *
+ * Pin dikonfigurasi sebagai INPUT_PULLUP lalu INPUT_PULLDOWN, dan level pada
+ * kedua kondisi dicatat. Perbandingan kedua nilai menunjukkan apakah jalur
+ * ditahan oleh komponen luar atau hanya mengikuti resistor internal.
+ */
+void probePin(uint8_t pin, int &hi, int &lo) {
+  pinMode(pin, INPUT_PULLUP);
+  delay(5);
+  hi = digitalRead(pin);
+
+  pinMode(pin, INPUT_PULLDOWN);
+  delay(5);
+  lo = digitalRead(pin);
+
+  pinMode(pin, INPUT);
+}
+
+/*
+ * Diagnostik jalur data DHT22.
+ *
+ * Kanvas Wokwi merutekan kabel secara otomatis sehingga sambungan yang
+ * bertumpuk sulit diperiksa secara visual. Fungsi ini membandingkan pin data
+ * dengan pin yang sengaja dikosongkan (REF_PROBE_PIN). Pin kosong menjadi
+ * acuan: bila pin kosong dan pin data memberi pola yang sama, jalur data
+ * kemungkinan besar juga kosong; bila berbeda, ada komponen yang menahan pin
+ * data dan kesalahannya ada pada urutan kabel.
+ */
+void dhtProbe() {
+  int hi, lo;
+  probePin(dhtActivePin, hi, lo);
+
+  int refHi, refLo;
+  probePin(REF_PROBE_PIN, refHi, refLo);
+
+  Serial.printf("[DHT] Probe GPIO%d: pull-up=%d pull-down=%d | "
+                "acuan GPIO%d: pull-up=%d pull-down=%d\n",
+                dhtActivePin, hi, lo, REF_PROBE_PIN, refHi, refLo);
+
+  bool refFloats = (refHi == 1 && refLo == 0);
+
+  if (!refFloats) {
+    Serial.println(F("[DHT] Pin acuan tidak berperilaku mengambang; simulator "
+                     "tidak menerapkan INPUT_PULLDOWN."));
+    Serial.println(F("[DHT] Hasil probe tidak dapat dipakai. Gunakan perintah "
+                     "\"scan\" untuk mencari pin tempat sensor terpasang."));
+    return;
+  }
+
+  if (hi == 1 && lo == 0) {
+    Serial.println(F("[DHT] GPIO data MENGAMBANG: tidak ada komponen terpasang."));
+    Serial.printf("[DHT] Sambungan \"dht1:SDA\" -> \"esp:D%d\" belum ada.\n",
+                  dhtActivePin);
+  } else if (hi == 0 && lo == 0) {
+    Serial.println(F("[DHT] GPIO data tertahan LOW: kabel data tertukar dengan GND."));
+  } else {
+    Serial.println(F("[DHT] GPIO data ditahan HIGH oleh komponen luar."));
+    Serial.println(F("[DHT] Dua kemungkinan: (a) SDA benar dan sensor siaga, atau"));
+    Serial.println(F("[DHT] (b) SDA tertukar dengan VCC sehingga menempel ke 3V3."));
+    Serial.println(F("[DHT] Urutan pad DHT22 kiri ke kanan: VCC, SDA, NC, GND."));
+    Serial.println(F("[DHT] Jalankan perintah \"scan\" untuk memastikan."));
+  }
+}
+
+/*
+ * Mencoba membaca DHT22 pada satu pin.
+ *
+ * setup() memberi tahu library pin mana yang dipakai dan mengatur ulang
+ * penghitung waktu, sehingga pembacaan berikutnya langsung dijalankan tanpa
+ * menunggu jeda 2 detik.
+ */
+bool dhtTryPin(uint8_t pin, float &t, float &h) {
+  dht.setup(pin, DHTesp::DHT22);
+  delay(10);
+
+  TempAndHumidity th = dht.getTempAndHumidity();
+  if (dht.getStatus() != DHTesp::ERROR_NONE) return false;
+
+  t = th.temperature;
+  h = th.humidity;
+  return true;
+}
+
+/*
+ * Mencari pin tempat DHT22 benar-benar terpasang.
+ *
+ * Setiap kandidat dicoba satu kali. Pin yang berhasil dibaca berarti di situlah
+ * jalur data sensor berada, sehingga kesalahan wiring dapat diketahui tanpa
+ * membaca kanvas. Pin yang dipakai komponen lain (OLED pada 21/22, buzzer pada
+ * 25, ADC dan DOUT MQ-2 pada 34/32) sengaja dilewati agar tidak mengganggu I2C
+ * maupun pembacaan sensor gas.
+ *
+ * Parameter adopt menentukan apakah pin hasil temuan langsung dipakai. Pada
+ * mode manual (perintah "scan") hasilnya hanya dilaporkan agar konfigurasi
+ * tidak berubah tanpa sepengetahuan pengguna.
+ */
+int dhtScan(bool adopt) {
+  const uint8_t kandidat[] = { 4, 2, 5, 12, 13, 14, 15, 18, 19, 23, 26, 27, 33 };
+  const uint8_t jumlah = sizeof(kandidat) / sizeof(kandidat[0]);
+
+  if (!adopt) Serial.println(F("[DHT] Mencari sensor pada pin kandidat..."));
+
+  /*
+   * Pola pin acuan dicatat lebih dahulu. Bila pin kosong pun terbaca HIGH pada
+   * kedua konfigurasi, simulator tidak menerapkan resistor pull-down dan pola
+   * (1,1) pada pin lain tidak dapat dianggap bukti adanya komponen.
+   */
+  int refHi, refLo;
+  probePin(REF_PROBE_PIN, refHi, refLo);
+  bool pulldownValid = (refHi == 1 && refLo == 0);
+
+  int ketemu = -1;
+  int ditahanHigh = -1;
+
+  for (uint8_t i = 0; i < jumlah; i++) {
+    uint8_t p = kandidat[i];
+    float t, h;
+
+    int hi, lo;
+    probePin(p, hi, lo);
+
+    if (dhtTryPin(p, t, h)) {
+      if (!adopt) {
+        Serial.printf("  GPIO%-2d : OK -> %.1f C, %.1f %%RH\n", p, t, h);
+      }
+      if (ketemu < 0) ketemu = p;
+    } else if (!adopt) {
+      Serial.printf("  GPIO%-2d : %-8s (pu=%d pd=%d)\n",
+                    p, dht.getStatusString(), hi, lo);
+      if (pulldownValid && hi == 1 && lo == 1 && ditahanHigh < 0) {
+        ditahanHigh = p;
+      }
+    }
+  }
+
+  if (ketemu >= 0 && adopt) {
+    dhtActivePin = (uint8_t)ketemu;
+    float t, h;
+    if (dhtTryPin(dhtActivePin, t, h)) {
+      tempC   = t;
+      humPct  = h;
+      dhtOk   = true;
+      dhtOkAt = millis();
+      dhtFail = 0;
+      dhtLastErr = "OK";
+    }
+  } else if (ketemu < 0) {
+    /* Tidak ada yang berhasil: kembalikan library ke pin semula. */
+    dht.setup(dhtActivePin, DHTesp::DHT22);
+    dhtOk = false;
+  }
+
+  if (!adopt) {
+    Serial.println(F("[DHT] ----------------------------------------"));
+    if (ketemu < 0) {
+      Serial.println(F("[DHT] Sensor tidak ditemukan pada pin mana pun."));
+      if (ditahanHigh >= 0) {
+        Serial.printf("[DHT] GPIO%d ditahan HIGH padahal pin acuan tidak, "
+                      "sehingga jalur data\n", ditahanHigh);
+        Serial.println(F("[DHT] kemungkinan menempel pada rel 3V3, bukan pada "
+                         "pin GPIO."));
+      }
+      Serial.printf("[DHT] Periksa tiga kabel DHT22: VCC->3V3, SDA->D%d, GND->GND.\n",
+                    PIN_DHT);
+      Serial.println(F("[DHT] Pad ketiga bertanda NC tidak boleh dipakai."));
+    } else if (ketemu == dhtActivePin) {
+      Serial.printf("[DHT] Sensor terpasang pada GPIO%d, sesuai sketch.\n", ketemu);
+      Serial.println(F("[DHT] Pembacaan gagal karena sebab lain; periksa VCC dan GND."));
+    } else {
+      Serial.printf("[DHT] Sensor terpasang pada GPIO%d, bukan GPIO%d.\n",
+                    ketemu, dhtActivePin);
+      Serial.printf("[DHT] Ubah \"#define PIN_DHT %d\" atau pindahkan kabel SDA "
+                    "ke esp:D%d.\n", ketemu, dhtActivePin);
+    }
+  }
+
+  return ketemu;
 }
 
 void setup() {
@@ -858,7 +1081,8 @@ void setup() {
   }
 
   /* DHT22: uji awal dijalankan sebelum WiFi agar tidak terganggu aktivitas radio */
-  dht.setup(PIN_DHT, DHTesp::DHT22);
+  dhtActivePin = PIN_DHT;
+  dht.setup(dhtActivePin, DHTesp::DHT22);
   dhtSelfTest();
 
   /* Skala sensor: nilai default, dapat dikalibrasi lewat Serial Monitor */
@@ -866,7 +1090,7 @@ void setup() {
   vAt1ppm    = V_AT_1PPM_DEFAULT;
   Serial.printf("[CAL] Skala log: %.4f V/dekade, 1 ppm = %.4f V\n",
                 vPerDecade, vAt1ppm);
-  Serial.println(F("[CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht"));
+  Serial.println(F("[CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht, scan"));
   Serial.println(F("[INFO] Kolom: CO=ppm i=instan raw=ADC V=volt d=DOUT"));
   Serial.println(F("[INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | AMAN->AMAN"));
 

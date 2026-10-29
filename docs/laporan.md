@@ -430,7 +430,8 @@ sehingga kegagalan sensor dapat dibedakan dari nilai yang memang berada di luar 
 
 ```
 ---- Status iklim mikro ----
-  DHT22      : terbaca
+  DHT22      : terbaca (GPIO4)
+  Status baca: OK (0 kegagalan berurutan)
   Suhu       : 41.2 C  (ambang panas >= 40.0 C)
   Kelembapan : 62.0 %RH (lembab >= 75, kering <= 20)
   Umur data  : 1204 ms sejak pembacaan valid terakhir
@@ -438,6 +439,25 @@ sehingga kegagalan sensor dapat dibedakan dari nilai yang memang berada di luar 
   Level CO   : WASPADA
   Level akhir: BAHAYA
 ```
+
+Perintah yang tersedia pada Serial Monitor:
+
+| Perintah | Fungsi |
+|---|---|
+| `c1 <ppm>` | menetapkan titik kalibrasi pertama pada konsentrasi gas acuan yang diketahui |
+| `c2 <ppm>` | menetapkan titik kalibrasi kedua; kedua titik menentukan koefisien skala logaritmik |
+| `dht` | menampilkan status iklim mikro, jumlah kegagalan berurutan, dan hasil uji jalur data |
+| `scan` | menguji pin kandidat untuk menemukan pin tempat DHT22 benar-benar terpasang |
+| `r` | mengembalikan skala sensor ke nilai bawaan |
+| `?` | menampilkan status kalibrasi beserta daftar perintah |
+
+Perintah `dht` dan `scan` bersifat diagnostik dan tidak mengubah kalibrasi maupun level yang
+sedang berjalan. Perintah `scan` diperlukan karena kanvas Wokwi merutekan kabel secara
+otomatis sehingga sambungan yang bertumpuk sulit diperiksa secara visual; hasil pemindaian
+menyebutkan nomor GPIO tempat sensor menjawab atau menyatakan bahwa sensor tidak ditemukan
+pada pin mana pun. Uji awal saat perangkat menyala menjalankan pemindaian yang sama secara
+otomatis, sehingga perangkat tetap memperoleh data iklim mikro meskipun sensor terpasang
+pada pin yang berbeda dari `#define PIN_DHT`.
 
 ### 9.2 Topik MQTT
 
