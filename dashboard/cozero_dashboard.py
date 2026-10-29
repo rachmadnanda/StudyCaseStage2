@@ -7,7 +7,12 @@ Tim Iki jenenge wes wkwk - Politeknik Negeri Malang
 Menerima data telemetri dari ESP32 (Wokwi) melalui MQTT HiveMQ Cloud,
 menampilkan grafik real-time (Matplotlib), dan menyimpan log ke CSV.
 
-Jalankan:
+Kedua panel grafik menampilkan kadar CO pada sumbu logaritmik beserta pita
+ambang batas, dan suhu/kelembapan kabin pada sumbu 0-100 dengan penanda
+kondisi ekstrem. Nilai iklim mikro yang tidak valid ditampilkan sebagai celah
+pada grafik, bukan sebagai garis mendatar di nol.
+
+Pemakaian:
     python cozero_dashboard.py --host xxxx.s1.eu.hivemq.cloud \
                                --user cozero --password RAHASIA
 
@@ -32,7 +37,7 @@ from matplotlib.animation import FuncAnimation
 import paho.mqtt.client as mqtt
 
 # ----------------------------------------------------------------------------
-# Konfigurasi default (boleh diubah lewat argumen CLI)
+# Konfigurasi default (dapat diubah melalui argumen CLI)
 # ----------------------------------------------------------------------------
 DEFAULT_HOST = "xxxxxxxxxxxx.s1.eu.hivemq.cloud"
 DEFAULT_PORT = 8883
@@ -47,6 +52,10 @@ TOPIC_STATUS = f"{TOPIC_BASE}/status"
 TH_WASPADA = 20
 TH_BAHAYA = 35
 TH_KRITIS = 115
+
+TH_TEMP_PANAS = 40.0      # celsius
+TH_RH_LEMBAB = 75.0       # %RH
+TH_RH_KERING = 20.0       # %RH
 
 MAX_POINTS = 600          # ~20 menit pada interval publish 2 detik
 WINDOW_SECONDS = 120      # jendela tampilan grafik
@@ -68,6 +77,9 @@ rh_buf = deque(maxlen=MAX_POINTS)
 
 state = {
     "level": "-",
+    "co_level": "-",
+    "env": "-",
+    "dht_ok": True,
     "device": "-",
     "last_seen": None,
     "online": False,
@@ -85,7 +97,10 @@ def open_csv(path):
     csv_writer = csv.writer(csv_file)
     if csv_file.tell() == 0:
         csv_writer.writerow(
-            ["timestamp", "device_id", "co_ppm", "temp_c", "rh", "level", "level_code"]
+            [
+                "timestamp", "device_id", "co_ppm", "temp_c", "rh",
+                "level", "level_code", "co_level", "env", "dht_ok",
+            ]
         )
 
 
@@ -132,9 +147,10 @@ def on_message(client, userdata, msg):
         print(f"[ALERT ] {raw}")
         try:
             d = json.loads(raw)
+            alasan = d.get("reason", "co")
             state["alerts"].append(
                 f"{datetime.now():%H:%M:%S}  {d.get('prev','?')} -> {d.get('level','?')} "
-                f"({d.get('co_ppm', 0):.1f} ppm)"
+                f"({d.get('co_ppm', 0):.2f} ppm, {alasan})"
             )
         except json.JSONDecodeError:
             pass
@@ -148,12 +164,19 @@ def on_message(client, userdata, msg):
         return
 
     now = datetime.now()
+    dht_ok = bool(d.get("dht_ok", True))
+
     ts_buf.append(now)
     co_buf.append(float(d.get("co_ppm", 0.0)))
-    temp_buf.append(float(d.get("temp_c", 0.0)))
-    rh_buf.append(float(d.get("rh", 0.0)))
+    # Nilai iklim mikro yang tidak valid dikirim sebagai NaN agar grafik
+    # menampilkan celah, bukan garis mendatar di 0 C / 0 %RH.
+    temp_buf.append(float(d.get("temp_c", 0.0)) if dht_ok else float("nan"))
+    rh_buf.append(float(d.get("rh", 0.0)) if dht_ok else float("nan"))
 
     state["level"] = d.get("level", "-")
+    state["co_level"] = d.get("co_level", "-")
+    state["env"] = d.get("env", "NORMAL") if dht_ok else "-"
+    state["dht_ok"] = dht_ok
     state["device"] = d.get("device_id", "-")
     state["last_seen"] = now
 
@@ -162,11 +185,14 @@ def on_message(client, userdata, msg):
             [
                 now.isoformat(timespec="seconds"),
                 d.get("device_id", ""),
-                f"{d.get('co_ppm', 0):.1f}",
-                f"{d.get('temp_c', 0):.1f}",
-                f"{d.get('rh', 0):.1f}",
+                f"{d.get('co_ppm', 0):.2f}",
+                f"{d.get('temp_c', 0):.1f}" if dht_ok else "",
+                f"{d.get('rh', 0):.1f}" if dht_ok else "",
                 d.get("level", ""),
                 d.get("level_code", ""),
+                d.get("co_level", ""),
+                d.get("env", "") if dht_ok else "",
+                "1" if dht_ok else "0",
             ]
         )
         csv_file.flush()
@@ -182,16 +208,22 @@ def build_figure():
     )
     fig.canvas.manager.set_window_title("CO-Zero Dashboard")
 
-    ax_co.set_ylabel("CO (ppm)")
+    ax_co.set_ylabel("CO (ppm, skala log)")
     ax_co.set_title("CO-Zero - Monitoring Kualitas Udara Kabin", fontsize=13, weight="bold")
-    ax_co.grid(alpha=0.3)
+    ax_co.grid(alpha=0.3, which="both")
+
+    # Sumbu CO memakai skala logaritmik: keluaran sensor MQ-2 sendiri logaritmik,
+    # dan rentang uji 0,1-570 ppm terlalu lebar untuk sumbu linear (pita AMAN
+    # akan mengecil sampai tak terlihat). Batas 1000 ppm di atas titik jenuh ADC.
+    CO_FLOOR, CO_CEIL = 0.1, 1000.0
+    ax_co.set_yscale("log")
+    ax_co.set_ylim(CO_FLOOR, CO_CEIL)
 
     # zona ambang batas
-    ax_co.axhspan(0, TH_WASPADA, color="#c8e6c9", alpha=0.55, label="AMAN (<20 ppm)")
+    ax_co.axhspan(CO_FLOOR, TH_WASPADA, color="#c8e6c9", alpha=0.55, label="AMAN (<20 ppm)")
     ax_co.axhspan(TH_WASPADA, TH_BAHAYA, color="#fff9c4", alpha=0.75, label="WASPADA (20-34)")
     ax_co.axhspan(TH_BAHAYA, TH_KRITIS, color="#ffe0b2", alpha=0.75, label="BAHAYA (35-114)")
-    ax_co.axhspan(TH_KRITIS, 400, color="#ffcdd2", alpha=0.75, label="KRITIS (>=115)")
-    ax_co.set_ylim(0, 200)
+    ax_co.axhspan(TH_KRITIS, CO_CEIL, color="#ffcdd2", alpha=0.75, label="KRITIS (>=115)")
     ax_co.legend(loc="upper left", fontsize=8, ncol=2)
 
     (line_co,) = ax_co.plot([], [], color="#c62828", linewidth=1.8, label="CO")
@@ -199,9 +231,20 @@ def build_figure():
     ax_env.set_ylabel("Suhu (C) / RH (%)")
     ax_env.set_xlabel("Waktu")
     ax_env.grid(alpha=0.3)
+
+    # Pita kondisi ekstrem. Suhu dan RH berbagi satu sumbu 0-100 agar kedua
+    # ambang lingkungan langsung terlihat pada skala yang sama.
+    ax_env.set_ylim(0, 100)
+    ax_env.axhspan(TH_RH_LEMBAB, 100, color="#b3e5fc", alpha=0.55,
+                   label=f"LEMBAB (>= {TH_RH_LEMBAB:.0f} %RH)")
+    ax_env.axhspan(0, TH_RH_KERING, color="#d7ccc8", alpha=0.55,
+                   label=f"KERING (<= {TH_RH_KERING:.0f} %RH)")
+    ax_env.axhline(TH_TEMP_PANAS, color="#d84315", linestyle="--", linewidth=1.2,
+                   label=f"PANAS (>= {TH_TEMP_PANAS:.0f} C)")
+
     (line_temp,) = ax_env.plot([], [], color="#1565c0", linewidth=1.4, label="Suhu (C)")
     (line_rh,) = ax_env.plot([], [], color="#00897b", linewidth=1.4, label="RH (%)")
-    ax_env.legend(loc="upper left", fontsize=8, ncol=2)
+    ax_env.legend(loc="upper left", fontsize=7, ncol=3)
 
     # format sumbu waktu
     locator = mdates.AutoDateLocator(minticks=4, maxticks=9)
@@ -230,8 +273,7 @@ def update(frame, ax_co, ax_env, line_co, line_temp, line_rh, status):
 
     ax_co.relim()
     ax_co.autoscale_view(scalex=False, scaley=False)
-    ax_env.relim()
-    ax_env.autoscale_view(scalex=False, scaley=True)
+    # Sumbu lingkungan dikunci 0-100 agar pita ambang tetap terbaca.
 
     # geser jendela waktu
     last = x[-1]
@@ -241,7 +283,18 @@ def update(frame, ax_co, ax_env, line_co, line_temp, line_rh, status):
     ax_co.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
 
     lvl = state["level"]
-    status.set_text(f"Status: {lvl}   |   CO: {co_buf[-1]:.1f} ppm   |   Device: {state['device']}")
+    co_lvl = state["co_level"]
+    env = state["env"]
+    if state["dht_ok"]:
+        status.set_text(
+            f"Status: {lvl}   |   CO: {co_buf[-1]:.2f} ppm ({co_lvl})"
+            f"   |   Iklim: {env}   |   Device: {state['device']}"
+        )
+    else:
+        status.set_text(
+            f"Status: {lvl}   |   CO: {co_buf[-1]:.2f} ppm ({co_lvl})"
+            f"   |   Iklim: DHT22 tidak terbaca   |   Device: {state['device']}"
+        )
     status.set_color(LEVEL_COLOR.get(lvl, "black"))
 
     if state["alerts"]:
@@ -266,7 +319,7 @@ def main():
     args = parser.parse_args()
 
     if "xxxx" in args.host:
-        print("!! Isi dulu --host / --user / --password dengan kredensial HiveMQ Cloud kamu.")
+        print("!! Argumen --host / --user / --password belum diisi dengan kredensial HiveMQ Cloud.")
         print("   Contoh: python cozero_dashboard.py --host abc123.s1.eu.hivemq.cloud "
               "--user cozero --password Rahasia123")
         sys.exit(1)

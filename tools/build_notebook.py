@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Membangun notebook Colab CO-Zero (cozero_dashboard_colab.ipynb)."""
+"""
+Membangun notebook Colab CO-Zero (dashboard/cozero_dashboard_colab.ipynb).
+
+Notebook ini adalah sumber tunggal tampilan dashboard berbasis Plotly. Berkas
+.ipynb dihasilkan ulang dari skrip ini agar isinya selalu konsisten dan dapat
+ditinjau sebagai teks biasa. Setelah mengubah isi sel di bawah, jalankan:
+
+    python tools/build_notebook.py
+"""
 import json
 import os
 
@@ -7,7 +15,8 @@ CELLS = []
 
 
 def md(text):
-    CELLS.append({"cell_type": "markdown", "metadata": {}, "source": text.strip("\n").splitlines(True)})
+    CELLS.append({"cell_type": "markdown", "metadata": {},
+                  "source": text.strip("\n").splitlines(True)})
 
 
 def code(text):
@@ -69,10 +78,16 @@ TOPIC_ALERT     = TOPIC_BASE + "/alert"
 TOPIC_STATUS    = TOPIC_BASE + "/status"
 
 TH_WASPADA, TH_BAHAYA, TH_KRITIS = 20, 35, 115
+
+# Ambang iklim mikro, identik dengan firmware
+TH_TEMP_PANAS = 40.0      # celsius
+TH_RH_LEMBAB  = 75.0      # %RH
+TH_RH_KERING  = 20.0      # %RH
+
 LEVEL_COLOR = {"AMAN": "#2e7d32", "WASPADA": "#f9a825",
                "BAHAYA": "#ef6c00", "KRITIS": "#c62828"}
 
-assert "xxxx" not in MQTT_HOST, "Isi dulu MQTT_HOST / MQTT_USER / MQTT_PASS"
+assert "xxxx" not in MQTT_HOST, "Kredensial MQTT_HOST / MQTT_USER / MQTT_PASS belum diisi"
 print("Konfigurasi OK ->", MQTT_HOST)
 """)
 
@@ -86,13 +101,11 @@ status = {"online": False, "last": None}
 
 _lock = threading.Lock()
 
-
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[MQTT] connected, rc =", rc)
     client.subscribe(TOPIC_TELEMETRY, qos=1)
     client.subscribe(TOPIC_ALERT, qos=1)
     client.subscribe(TOPIC_STATUS, qos=1)
-
 
 def on_message(client, userdata, msg):
     payload = msg.payload.decode("utf-8", errors="replace")
@@ -106,7 +119,8 @@ def on_message(client, userdata, msg):
         try:
             d = json.loads(payload)
             alerts.append(f"{datetime.now():%H:%M:%S}  {d.get('prev')} -> "
-                          f"{d.get('level')} ({d.get('co_ppm', 0):.1f} ppm)")
+                          f"{d.get('level')} ({d.get('co_ppm', 0):.2f} ppm, "
+                          f"{d.get('reason', 'co')})")
         except Exception:
             pass
         return
@@ -116,18 +130,23 @@ def on_message(client, userdata, msg):
     except json.JSONDecodeError:
         return
 
+    dht_ok = bool(d.get("dht_ok", True))
     with _lock:
         rows.append({
             "waktu": datetime.now(),
             "device": d.get("device_id", "-"),
             "co_ppm": float(d.get("co_ppm", 0)),
-            "temp_c": float(d.get("temp_c", 0)),
-            "rh": float(d.get("rh", 0)),
+            # Nilai iklim mikro tidak valid dikirim sebagai NaN agar grafik
+            # menampilkan celah, bukan garis mendatar di 0 C / 0 %RH.
+            "temp_c": float(d.get("temp_c", 0)) if dht_ok else float("nan"),
+            "rh": float(d.get("rh", 0)) if dht_ok else float("nan"),
             "level": d.get("level", "-"),
             "level_code": int(d.get("level_code", 0)),
+            "co_level": d.get("co_level", "-"),
+            "env": d.get("env", "NORMAL") if dht_ok else "-",
+            "dht_ok": dht_ok,
         })
         status["last"] = datetime.now()
-
 
 def make_client():
     cid = f"cozero-colab-{int(time.time())}"
@@ -136,7 +155,6 @@ def make_client():
                            protocol=mqtt.MQTTv311)
     except (AttributeError, TypeError):
         return mqtt.Client(client_id=cid, protocol=mqtt.MQTTv311)
-
 
 client = make_client()
 client.username_pw_set(MQTT_USER, MQTT_PASS)
@@ -148,50 +166,84 @@ client.on_message = on_message
 client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
 client.loop_start()
 time.sleep(2)
-print("Menunggu data... (nyalakan simulasi Wokwi sekarang)")
+print("Menunggu data... (simulasi Wokwi dijalankan pada tahap ini)")
 """)
 
-code(r"""
+code(r'''
 # ============================================================
-#  Dashboard live (Plotly) — jalankan selama demo / rekam video
+#  Dashboard live (Plotly) — dijalankan selama demo / perekaman video
 # ============================================================
+from plotly.subplots import make_subplots
+
+def _band(fig, yref, y0, y1, warna, opacity=0.55):
+    """Pita horizontal pada subplot tertentu (kompatibel plotly 5 dan 7)."""
+    fig.add_shape(type="rect", xref="paper", x0=0, x1=1, yref=yref,
+                  y0=y0, y1=y1, fillcolor=warna, opacity=opacity,
+                  line_width=0, layer="below")
+
 def render(df):
     last = df.iloc[-1]
     warna = LEVEL_COLOR.get(last["level"], "gray")
 
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.65, 0.35], vertical_spacing=0.10,
+        subplot_titles=("Kadar CO kabin", "Iklim mikro kabin"),
+    )
 
-    # pita ambang batas
-    fig.add_hrect(y0=0, y1=TH_WASPADA, fillcolor="#c8e6c9", opacity=0.45, line_width=0)
-    fig.add_hrect(y0=TH_WASPADA, y1=TH_BAHAYA, fillcolor="#fff9c4", opacity=0.60, line_width=0)
-    fig.add_hrect(y0=TH_BAHAYA, y1=TH_KRITIS, fillcolor="#ffe0b2", opacity=0.60, line_width=0)
-    fig.add_hrect(y0=TH_KRITIS, y1=max(200, df.co_ppm.max() * 1.2),
-                  fillcolor="#ffcdd2", opacity=0.60, line_width=0)
+    # --- panel CO: pita ambang batas, sumbu logaritmik ---
+    CO_FLOOR, CO_CEIL = 0.1, 1000.0
+    _band(fig, "y", CO_FLOOR, TH_WASPADA, "#c8e6c9", 0.45)
+    _band(fig, "y", TH_WASPADA, TH_BAHAYA, "#fff9c4", 0.60)
+    _band(fig, "y", TH_BAHAYA, TH_KRITIS, "#ffe0b2", 0.60)
+    _band(fig, "y", TH_KRITIS, CO_CEIL, "#ffcdd2", 0.60)
 
     fig.add_trace(go.Scatter(x=df.waktu, y=df.co_ppm, mode="lines+markers",
-                             name="CO (ppm)", line=dict(color="#c62828", width=2)))
+                             name="CO (ppm)", line=dict(color="#c62828", width=2)),
+                  row=1, col=1)
+
+    # --- panel iklim mikro: pita LEMBAB / KERING + garis PANAS ---
+    _band(fig, "y2", TH_RH_LEMBAB, 100, "#b3e5fc")
+    _band(fig, "y2", 0, TH_RH_KERING, "#d7ccc8")
+    fig.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y2",
+                  y0=TH_TEMP_PANAS, y1=TH_TEMP_PANAS,
+                  line=dict(color="#d84315", width=1.5, dash="dash"))
+
+    fig.add_trace(go.Scatter(x=df.waktu, y=df.temp_c, mode="lines",
+                             name="Suhu (°C)", line=dict(color="#1565c0", width=1.6)),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.waktu, y=df.rh, mode="lines",
+                             name="RH (%)", line=dict(color="#00897b", width=1.6)),
+                  row=2, col=1)
+
+    if last["dht_ok"]:
+        iklim = f"{last['temp_c']:.1f} °C / {last['rh']:.0f} %RH ({last['env']})"
+    else:
+        iklim = "DHT22 tidak terbaca"
 
     fig.update_layout(
         title=dict(
             text=(f"<b>CO-Zero Dashboard</b> — status <span style='color:{warna}'>"
-                  f"<b>{last['level']}</b></span> | {last['co_ppm']:.1f} ppm | "
-                  f"{last['temp_c']:.1f} °C | {last['rh']:.0f} % RH"),
+                  f"<b>{last['level']}</b></span> | CO {last['co_ppm']:.2f} ppm "
+                  f"(level CO: {last['co_level']}) | iklim: {iklim}"),
             x=0.5, xanchor="center"),
-        xaxis_title="Waktu",
-        yaxis_title="Konsentrasi CO (ppm)",
-        yaxis=dict(range=[0, max(120, df.co_ppm.max() * 1.25)]),
         template="plotly_white",
-        height=460,
-        margin=dict(l=60, r=30, t=80, b=50),
-        legend=dict(orientation="h", y=1.08),
+        height=680,
+        margin=dict(l=60, r=30, t=90, b=50),
+        legend=dict(orientation="h", y=1.04),
+        showlegend=True,
     )
+    fig.update_yaxes(title_text="CO (ppm, skala log)", type="log",
+                     range=[-1, 3], row=1, col=1)
+    fig.update_yaxes(title_text="Suhu (°C) / RH (%)", range=[0, 100], row=2, col=1)
+    fig.update_xaxes(title_text="Waktu", row=2, col=1)
+
     fig.add_annotation(x=df.waktu.iloc[-1], y=last["co_ppm"],
-                       text=f"{last['co_ppm']:.1f} ppm", showarrow=True,
-                       arrowhead=2, ay=-30)
+                       text=f"{last['co_ppm']:.2f} ppm", showarrow=True,
+                       arrowhead=2, ay=-30, row=1, col=1)
     return fig
 
-
-DURASI = 90      # detik; ubah sesuai kebutuhan
+DURASI = 90      # detik; sesuaikan dengan durasi demo
 for i in range(DURASI):
     with _lock:
         data = list(rows)
@@ -210,7 +262,7 @@ for i in range(DURASI):
         for a in list(alerts)[-5:]:
             print("  •", a)
     time.sleep(1)
-""")
+''')
 
 code(r"""
 # ============================================================
@@ -262,4 +314,5 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 out = os.path.join(ROOT, "dashboard", "cozero_dashboard_colab.ipynb")
 with open(out, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
+    f.write("\n")
 print("Notebook dibuat:", out)

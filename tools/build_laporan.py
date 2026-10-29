@@ -23,7 +23,7 @@ OUT = os.path.join(ROOT, "docs", "Laporan-CO-Zero-SIC8.docx")
 
 BODY_FONT = "Times New Roman"
 HEAD_FONT = "Calibri"
-CODE_FONT = "Consolas"
+CODE_FONT = "Courier New"
 ACCENT = RGBColor(0x1A, 0x3C, 0x6E)
 
 BOX_MAP = str.maketrans({
@@ -225,15 +225,18 @@ def add_heading(doc, text, level):
 def add_code_block(doc, code_lines):
     text = "\n".join(code_lines).translate(BOX_MAP)
     p = doc.add_paragraph()
-    p.paragraph_format.left_indent = Cm(0.4)
+    p.paragraph_format.left_indent = Cm(0.2)
     p.paragraph_format.space_before = Pt(4)
     p.paragraph_format.space_after = Pt(8)
     p.paragraph_format.line_spacing = 1.0
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT   # ASCII art wajib rata kiri
     shade_paragraph(p, "F2F4F7")
     run = p.add_run(text)
     run.font.name = CODE_FONT
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), CODE_FONT)
-    run.font.size = Pt(8.5)
+    rf = run._element.rPr.rFonts
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rf.set(qn(attr), CODE_FONT)
+    run.font.size = Pt(8)
     return p
 
 
@@ -333,6 +336,9 @@ def add_bullet(doc, text, ordered=False):
         return None
     p = doc.add_paragraph(style="List Bullet")
     p.paragraph_format.space_after = Pt(2)
+    # indent eksplisit agar baris lanjutan sejajar dengan teks, bukan lebih menjorok
+    p.paragraph_format.left_indent = Cm(1.0)
+    p.paragraph_format.first_line_indent = Cm(-0.5)
     add_inline(p, text, size=11)
 
 

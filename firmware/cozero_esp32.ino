@@ -9,19 +9,22 @@
  *
  *  Alur sistem:
  *    MQ-2 (AOUT) --> ADC GPIO34 --> moving average --> klasifikasi level
- *        --> LED + Buzzer + OLED (lokal, tetap jalan tanpa internet)
+ *        --> Buzzer + OLED (lokal, tetap jalan tanpa internet)
  *        --> WiFi --> MQTT (HiveMQ Cloud) --> Dashboard Python
  *
  *  CATATAN SIMULASI
  *    - Wokwi tidak menyediakan MQ-7. Digunakan modul MQ-2 yang juga sensitif
  *      terhadap CO. Keduanya sensor MOS berbasis heater dengan keluaran analog,
  *      sehingga logika sistem tidak berubah.
- *    - Nilai ppm sensor di Wokwi diatur lewat atribut "ppm" pada diagram.json
- *      dan bisa digeser saat simulasi berjalan (klik sensor).
- *    - Kalau atribut "ppm" diabaikan simulator, cukup geser slider setelah
- *      simulasi berjalan. Kalibrasi dua titik (c1/c2) membuat skala ppm tetap
- *      akurat tanpa mengubah kode.
- *    - Resistor pembagi tegangan tidak bisa dipakai di Wokwi; lihat bagian
+ *    - Nilai ppm sensor di Wokwi diatur melalui atribut "ppm" pada diagram.json
+ *      dan dapat digeser saat simulasi berjalan (klik sensor).
+ *    - Bila atribut "ppm" diabaikan simulator, slider digeser setelah simulasi
+ *      berjalan. Kalibrasi dua titik (c1/c2) membuat skala ppm tetap akurat
+ *      tanpa perubahan kode.
+ *    - Keluaran sensor MQ-2 bersifat LOGARITMIK, bukan linear: setiap kenaikan
+ *      satu dekade (10x) konsentrasi menaikkan Vout sekitar 0,68 V. Konversi
+ *      ppm memakai powf(10, ...) - lihat readCoPpm().
+ *    - Resistor pembagi tegangan tidak dapat dipakai di Wokwi; lihat bagian
  *      KONFIGURASI (DIVIDER_RATIO).
  * ============================================================================
  */
@@ -44,7 +47,7 @@
 #define WIFI_SSID       "Wokwi-GUEST"
 #define WIFI_PASS       ""
 
-/* --- HiveMQ Cloud (ganti dengan kredensial cluster kamu) --- */
+/* --- HiveMQ Cloud (isi dengan kredensial cluster) --- */
 #define MQTT_HOST       "xxxxxxxxxxxx.s1.eu.hivemq.cloud"
 #define MQTT_PORT       8883
 #define MQTT_USER       "ISI_USERNAME_HIVEMQ"
@@ -56,30 +59,45 @@
 #define TOPIC_ALERT     TOPIC_BASE "/alert"
 #define TOPIC_STATUS    TOPIC_BASE "/status"
 
-/* --- Pin GPIO (lihat tabel di laporan) --- */
+/* --- Pin GPIO (rincian pada tabel laporan) --- */
 #define PIN_MQ_ADC      34   // ADC1_CH6, input-only
 #define PIN_MQ_DOUT     32   // keluaran digital MQ-2 (redundan)
 #define PIN_DHT         4
 #define PIN_BUZZER      25
-#define PIN_LED_G       26
-#define PIN_LED_Y       27
-#define PIN_LED_R       14
 #define PIN_OLED_SDA    21
 #define PIN_OLED_SCL    22
 
-/* --- Ambang batas (ppm) --- */
+/* --- Ambang batas kadar CO (ppm) --- */
 #define TH_WASPADA      20
 #define TH_BAHAYA       35
 #define TH_KRITIS       115
-#define HISTERESIS      3.0f   // ppm, mencegah LED berkedip di batas
+#define HISTERESIS      3.0f   // ppm, mencegah buzzer berkedip di batas
+
+/*
+ * Ambang batas iklim mikro kabin. Nilai ini tidak menentukan level secara
+ * mandiri, melainkan memperberat level CO (lihat combineLevels()).
+ *
+ *   suhu >= 40 C      -> PANAS   : beban panas menambah risiko hipoksia
+ *   RH   >= 75 %      -> LEMBAB  : penguapan keringat terhambat
+ *   RH   <= 20 %      -> KERING  : iritasi saluran napas
+ *
+ * Deadband dipakai agar indikator tidak berkedip saat nilai berada tepat
+ * di ambang.
+ */
+#define TH_TEMP_PANAS   40.0f
+#define TH_RH_LEMBAB    75.0f
+#define TH_RH_KERING    20.0f
+#define ENV_HYST_TEMP   1.0f
+#define ENV_HYST_RH     3.0f
 
 /* --- Waktu (ms) --- */
 #define SAMPLE_MS       500
 #define PUBLISH_MS      2000
-#define DHT_MS          2500
+#define DHT_MS          2200    // DHT22 butuh jeda minimal 2000 ms antar pembacaan
 #define OLED_MS         300
 #define MQTT_RETRY_MS   5000
 #define WIFI_RETRY_MS   5000
+#define DHT_BOOT_TRIES  3       // jumlah percobaan pada uji awal saat boot
 
 /* --- Konversi sensor --- */
 #define ADC_MAX         4095.0f
@@ -98,14 +116,46 @@
 #define AVG_WINDOW      5       // moving average
 
 /*
- * Skala awal: diasumsikan keluaran MQ-2 Wokwi linier 0..5 V untuk 0..1000 ppm,
- * sehingga 1 V = 200 ppm. Dengan VCC 5 V dan ADC 12-bit (3,3 V), pembacaan
- * masih linear sampai sekitar 660 ppm - cukup untuk seluruh skenario uji.
- * Jika angka ppm di Serial tidak cocok dengan slider sensor, lakukan
- * KALIBRASI DUA TITIK lewat Serial Monitor (lihat fungsi handleSerial()).
+ * Lompatan ppm dianggap perubahan nyata (misalnya slider sensor digeser) bila
+ * melebihi FAST_TRACK_PPM atau lebih dari 30% nilai saat ini. Riwayat moving
+ * average kemudian dibuang agar nilai terbaru langsung dipakai. Tanpa mekanisme
+ * ini, nilai ppm tampak tidak menentu selama +-2,5 detik setiap kali slider
+ * digeser karena rata-rata masih menyusul nilai lama.
  */
-#define PPM_PER_VOLT_DEFAULT  200.0f
-#define BASELINE_VOLT_DEFAULT 0.0f
+#define FAST_TRACK_PPM  40.0f
+
+/*
+ * SKALA SENSOR: LOGARITMIK
+ * ---------------------------------------------------------------------------
+ * Keluaran MQ-2/MQ-7 tidak linear terhadap konsentrasi, melainkan logaritmik
+ * (kurva Rs/R0 pada datasheet). Pengukuran langsung pada simulator Wokwi:
+ *
+ *     slider 0,1 ppm   -> Vout 0,679 V
+ *     slider 3 ppm     -> Vout 1,689 V
+ *     slider 100.000   -> Vout 3,257 V  (ADC mulai jenuh)
+ *
+ * Ketiga titik itu persis mengikuti  V = 1,3629 + 0,6836 x log10(ppm).
+ * Hubungan ini menghasilkan satu dekade (10x) konsentrasi untuk setiap
+ * 0,6836 V kenaikan tegangan, sehingga kadar CO dihitung dengan:
+ *
+ *     ppm = 10 ^ ((Vout - V_AT_1PPM) / V_PER_DECADE)
+ *
+ * Nilai default di bawah berasal dari regresi ketiga titik tersebut. Bila hasil
+ * pembacaan belum sesuai dengan slider, dilakukan KALIBRASI DUA TITIK melalui
+ * Serial Monitor (perintah c1/c2, lihat fungsi handleSerial()).
+ *
+ * Batas atas: ADC jenuh pada 3,300 V yang setara +-682 ppm, sehingga seluruh
+ * skenario uji (termasuk 570 ppm = 3,247 V) masih terbaca sebelum jenuh.
+ */
+#define V_PER_DECADE_DEFAULT   0.6836f
+#define V_AT_1PPM_DEFAULT      1.3629f
+
+/*
+ * Ambang komparator DOUT pada modul MQ-2 (atribut "threshold" di diagram.json).
+ * Dipakai untuk memastikan DOUT hanya dipercaya bila tegangan AOUT memang sudah
+ * melewatinya. Nilai 4,0 V berarti komparator baru aktif di atas kisaran uji.
+ */
+#define DOUT_THRESHOLD_V      4.0f
 
 /* ==========================================================================
  *  2. OBJEK GLOBAL
@@ -120,6 +170,9 @@ PubSubClient mqtt(net);
 enum Level { LV_AMAN = 0, LV_WASPADA = 1, LV_BAHAYA = 2, LV_KRITIS = 3 };
 const char* LEVEL_NAME[4] = { "AMAN", "WASPADA", "BAHAYA", "KRITIS" };
 const float LEVEL_TH[4]  = { -1.0f, TH_WASPADA, TH_BAHAYA, TH_KRITIS };
+
+enum EnvFlag { ENV_NORMAL = 0, ENV_PANAS = 1, ENV_LEMBAB = 2, ENV_KERING = 3 };
+const char* ENV_NAME[4] = { "NORMAL", "PANAS", "LEMBAB", "KERING" };
 // ==LOGIC-TYPES-END==
 
 /* state sensor */
@@ -133,8 +186,8 @@ float lastVoltOut   = 0.0f;
 bool  mqDoutLow     = false;
 
 /* kalibrasi (dapat diubah saat runtime lewat Serial Monitor) */
-float ppmPerVolt    = PPM_PER_VOLT_DEFAULT;
-float baselineVolt  = BASELINE_VOLT_DEFAULT;
+float vPerDecade    = V_PER_DECADE_DEFAULT;
+float vAt1ppm       = V_AT_1PPM_DEFAULT;
 
 /* titik kalibrasi yang sedang menunggu pasangan (NaN = belum diisi) */
 float calPpm[2]     = { NAN, NAN };
@@ -144,9 +197,13 @@ float calVolt[2]    = { NAN, NAN };
 float tempC         = 0.0f;
 float humPct        = 0.0f;
 bool  dhtOk         = false;
+unsigned long dhtOkAt   = 0;      // waktu pembacaan DHT terakhir yang valid
+unsigned int  dhtFail   = 0;      // jumlah kegagalan berurutan
 
 /* state sistem */
-Level level         = LV_AMAN;
+Level   coLevel     = LV_AMAN;    // level dari kadar CO saja (dengan histeresis)
+Level   level       = LV_AMAN;    // level akhir: CO + kondisi lingkungan
+EnvFlag envFlag     = ENV_NORMAL;
 
 /* timing */
 unsigned long tSample = 0, tPublish = 0, tDht = 0, tOled = 0, tMqtt = 0, tWifi = 0;
@@ -154,6 +211,9 @@ unsigned long bootMillis = 0;
 
 /* buzzer */
 bool bzState = false;
+
+/* MQTT hanya diaktifkan bila kredensial HiveMQ sudah diisi */
+bool mqttConfigured = false;
 
 /* ==========================================================================
  *  3. PEMBACAAN SENSOR
@@ -176,20 +236,25 @@ float readVoltageOut() {
 /*
  * Kalibrasi dua titik, dijalankan SAAT SIMULASI BERJALAN lewat Serial Monitor.
  *
- *  1. Geser slider ppm sensor ke nilai acuan pertama, misal 100.
- *  2. Ketik:  c1 100      -> firmware menyimpan pasangan (100 ppm, Vout saat ini)
- *  3. Geser slider ke nilai acuan kedua, misal 500.
- *  4. Ketik:  c2 500      -> firmware menghitung ppmPerVolt dan baselineVolt
- *
- * PENTING: pilih titik acuan di daerah linear ADC (disarankan 100 dan 500 ppm).
- * Tanpa pembagi tegangan, ADC ESP32 jenuh di sekitar 3,1-3,3 V sehingga titik
- * acuan yang terlalu tinggi (mis. 900 ppm) akan menghasilkan kalibrasi salah.
+ *  1. Geser slider ppm sensor ke nilai acuan pertama, misal 10.
+ *  2. Ketik:  c1 10       -> firmware menyimpan pasangan (10 ppm, Vout saat ini)
+ *  3. Geser slider ke nilai acuan kedua, misal 100.
+ *  4. Ketik:  c2 100      -> firmware menghitung vPerDecade dan vAt1ppm
  *  5. Ketik:  ?           -> menampilkan hasil kalibrasi
  *  6. Ketik:  r           -> kembali ke nilai default
  *
+ * Kalibrasi dilakukan di RUANG LOGARITMIK, bukan linear, karena kurva sensor
+ * berbentuk  V = a + b x log10(ppm). Dua titik acuan menghasilkan:
+ *     b (vPerDecade) = (V2 - V1) / (log10(ppm2) - log10(ppm1))
+ *     a (vAt1ppm)    = V1 - b x log10(ppm1)
+ *
+ * PENTING: pilih titik acuan yang jaraknya minimal satu dekade (mis. 10 dan
+ * 100 ppm) dan masih di bawah 682 ppm, karena di atas itu ADC ESP32 sudah
+ * jenuh (3,3 V) sehingga titik acuan tidak lagi valid.
+ *
  * Hasil kalibrasi hanya tersimpan di RAM (hilang saat restart), sesuai
  * kebutuhan simulasi. Untuk perangkat fisik, simpan nilainya sebagai
- * PPM_PER_VOLT_DEFAULT / BASELINE_VOLT_DEFAULT di bagian KONFIGURASI.
+ * V_PER_DECADE_DEFAULT / V_AT_1PPM_DEFAULT di bagian KONFIGURASI.
  */
 void captureCalPoint(int idx, float ppmRef) {
   calPpm[idx]  = ppmRef;
@@ -197,33 +262,91 @@ void captureCalPoint(int idx, float ppmRef) {
   Serial.printf("[CAL] Titik %d disimpan: %.1f ppm = %.4f V\n",
                 idx + 1, ppmRef, lastVoltOut);
 
-  if (!isnan(calPpm[0]) && !isnan(calPpm[1]) && fabs(calVolt[1] - calVolt[0]) > 0.01f) {
-    ppmPerVolt = (calPpm[1] - calPpm[0]) / (calVolt[1] - calVolt[0]);
-    baselineVolt = calVolt[0] - (calPpm[0] / ppmPerVolt);
-    Serial.printf("[CAL] Selesai -> ppmPerVolt = %.2f | baseline = %.4f V\n",
-                  ppmPerVolt, baselineVolt);
-    Serial.println(F("[CAL] Salin kedua nilai ini ke bagian KONFIGURASI sketch."));
+  if (isnan(calPpm[0]) || isnan(calPpm[1])) return;
+
+  float dl = log10f(calPpm[1]) - log10f(calPpm[0]);
+  if (fabs(dl) < 0.3f) {   // butuh jarak minimal ~2x antar titik acuan
+    Serial.println(F("[CAL] Titik acuan terlalu berdekatan. Gunakan mis. 10 dan 100 ppm."));
+    return;
   }
+
+  vPerDecade = (calVolt[1] - calVolt[0]) / dl;
+  vAt1ppm    = calVolt[0] - vPerDecade * log10f(calPpm[0]);
+
+  Serial.printf("[CAL] Selesai -> vPerDecade = %.4f | vAt1ppm = %.4f V\n",
+                vPerDecade, vAt1ppm);
+  Serial.println(F("[CAL] Kedua nilai disalin ke bagian KONFIGURASI sketch."));
 }
 
 void printCalState() {
   Serial.println(F("---- Status kalibrasi ----"));
-  Serial.printf("  ppmPerVolt = %.2f\n", ppmPerVolt);
-  Serial.printf("  baseline   = %.4f V\n", baselineVolt);
+  Serial.printf("  vPerDecade = %.4f V/dekade\n", vPerDecade);
+  Serial.printf("  vAt1ppm    = %.4f V\n", vAt1ppm);
   Serial.printf("  Vout kini  = %.4f V -> %.1f ppm\n",
                 lastVoltOut, ppmAvg);
-  Serial.println(F("  Perintah: c1 <ppm> | c2 <ppm> | r | ?"));
+  Serial.println(F("  Perintah: c1 <ppm> | c2 <ppm> | dht | r | ?"));
 }
 
-float readCoPpm() {
-  float v = readVoltageOut();
-  float ppm = (v - baselineVolt) * ppmPerVolt;
-  if (ppm < 0.0f) ppm = 0.0f;
+/*
+ * Ringkasan keadaan sensor iklim mikro dan hasil klasifikasinya. Berguna untuk
+ * memastikan apakah kegagalan berasal dari sensor (dhtOk = false) atau dari
+ * nilai yang memang berada di luar ambang.
+ */
+void printDhtState() {
+  Serial.println(F("---- Status iklim mikro ----"));
+  Serial.printf("  DHT22      : %s\n", dhtOk ? "terbaca" : "TIDAK TERBACA");
+  if (dhtOk) {
+    Serial.printf("  Suhu       : %.1f C  (ambang panas >= %.1f C)\n",
+                  tempC, TH_TEMP_PANAS);
+    Serial.printf("  Kelembapan : %.1f %%RH (lembab >= %.0f, kering <= %.0f)\n",
+                  humPct, TH_RH_LEMBAB, TH_RH_KERING);
+    Serial.printf("  Umur data  : %lu ms sejak pembacaan valid terakhir\n",
+                  millis() - dhtOkAt);
+  }
+  Serial.printf("  Flag       : %s\n",
+                dhtOk ? ENV_NAME[envFlag] : "NORMAL (dilewati)");
+  Serial.printf("  Level CO   : %s\n", LEVEL_NAME[coLevel]);
+  Serial.printf("  Level akhir: %s\n", LEVEL_NAME[level]);
+}
+
+/*
+ * Konversi tegangan -> ppm memakai hubungan logaritmik sensor MOS.
+ * Dibuat sebagai fungsi murni (tanpa variabel global) agar dapat diuji
+ * terpisah oleh tools/test_logic.py.
+ *
+ *   Vout 0,679 V -> 0,10 ppm
+ *   Vout 1,689 V -> 3,00 ppm
+ *   Vout 3,257 V -> 589 ppm  (ADC mulai jenuh)
+ */
+// ==LOGIC-SCALE-BEGIN==
+float voltsToPpm(float v, float perDecade, float at1ppm) {
+  if (perDecade <= 0.0f) return 0.0f;           // kalibrasi tidak valid
+  float ppm = powf(10.0f, (v - at1ppm) / perDecade);
+  if (ppm < 0.0f)     ppm = 0.0f;
+  if (ppm > 10000.0f) ppm = 10000.0f;           // batas atas wajar
   return ppm;
 }
+// ==LOGIC-SCALE-END==
 
-/* Moving average sederhana untuk menstabilkan pembacaan. */
+float readCoPpm() {
+  return voltsToPpm(readVoltageOut(), vPerDecade, vAt1ppm);
+}
+
+/* Moving average sederhana untuk menstabilkan pembacaan.
+ * Bila nilai baru melompat jauh (slider digeser atau kondisi berubah cepat),
+ * buffer dikosongkan agar tampilan langsung mengikuti nilai terbaru.
+ * Ambang lompatan memakai nilai absolut atau relatif, karena pada skala
+ * logaritmik selisih 40 ppm bermakna sangat berbeda pada 0,1 ppm dan 500 ppm. */
 float pushAverage(float v) {
+  float ref   = (ppmAvg > 1.0f) ? ppmAvg : 1.0f;
+  float delta = fabs(v - ppmAvg);
+
+  if (delta > FAST_TRACK_PPM || delta > 0.3f * ref) {
+    for (int i = 0; i < AVG_WINDOW; i++) avgBuf[i] = v;
+    avgFilled = true;
+    return v;
+  }
+
   avgBuf[avgIdx] = v;
   avgIdx = (avgIdx + 1) % AVG_WINDOW;
   if (avgIdx == 0) avgFilled = true;
@@ -254,15 +377,73 @@ Level classify(float ppm, Level prev) {
 }
 // ==LOGIC-CLASSIFY-END==
 
+/*
+ * Penilaian iklim mikro kabin.
+ *
+ * Suhu dan kelembapan TIDAK menentukan level secara mandiri. Keduanya hanya
+ * menghasilkan flag lingkungan yang kemudian dipakai untuk memperberat level
+ * CO (lihat combineLevels()). Dengan cara ini sensor gas tetap menjadi sumber
+ * utama keputusan, sementara kondisi kabin yang memperburuk risiko ikut
+ * diperhitungkan.
+ *
+ * Parameter "valid" bernilai false bila sensor DHT22 tidak terbaca. Pada
+ * kondisi itu fungsi mengembalikan ENV_NORMAL agar kegagalan sensor tidak
+ * memicu eskalasi level palsu.
+ */
+// ==LOGIC-ENV-BEGIN==
+EnvFlag envCheck(float t, float rh, bool valid, EnvFlag prev) {
+  if (!valid) return ENV_NORMAL;
+
+  EnvFlag lv = ENV_NORMAL;
+  if      (t  >= TH_TEMP_PANAS) lv = ENV_PANAS;   // suhu diprioritaskan
+  else if (rh >= TH_RH_LEMBAB)  lv = ENV_LEMBAB;
+  else if (rh <= TH_RH_KERING)  lv = ENV_KERING;
+
+  /*
+   * Deadband: bila nilai sudah kembali ke rentang normal tetapi masih berada
+   * di dalam pita deadband, flag sebelumnya dipertahankan agar indikator
+   * tidak berkedip di sekitar ambang.
+   */
+  if (lv == ENV_NORMAL && prev != ENV_NORMAL) {
+    bool panas  = (prev == ENV_PANAS)  && (t  > TH_TEMP_PANAS - ENV_HYST_TEMP);
+    bool lembab = (prev == ENV_LEMBAB) && (rh > TH_RH_LEMBAB  - ENV_HYST_RH);
+    bool kering = (prev == ENV_KERING) && (rh < TH_RH_KERING  + ENV_HYST_RH);
+    if (panas || lembab || kering) lv = prev;
+  }
+  return lv;
+}
+
+/*
+ * Menggabungkan level CO dengan flag lingkungan.
+ *
+ * Aturan eskalasi (satu tingkat, tidak pernah melompat):
+ *
+ *   CO              lingkungan        level akhir
+ *   AMAN            NORMAL            AMAN
+ *   AMAN            ekstrem           WASPADA
+ *   WASPADA         NORMAL            WASPADA
+ *   WASPADA         ekstrem           BAHAYA
+ *   BAHAYA          NORMAL            BAHAYA
+ *   BAHAYA          ekstrem           KRITIS
+ *   KRITIS          apa pun           KRITIS
+ *
+ * Dasar pertimbangan: suhu tinggi menambah beban kardiovaskular sehingga
+ * tubuh lebih cepat kekurangan oksigen, sedangkan kelembapan tinggi
+ * menghambat penguapan keringat dan lazim menyertai kabin tertutup dengan
+ * sirkulasi resirkulasi. Keduanya memperberat dampak kadar CO yang sama.
+ * Lingkungan ekstrem sendirian tidak pernah menghasilkan BAHAYA atau KRITIS.
+ */
+Level combineLevels(Level co, EnvFlag env) {
+  if (env == ENV_NORMAL) return co;
+  if (co == LV_AMAN)     return LV_WASPADA;
+  if (co >= LV_KRITIS)   return LV_KRITIS;
+  return (Level)((int)co + 1);
+}
+// ==LOGIC-ENV-END==
+
 /* ==========================================================================
  *  4. OUTPUT LOKAL
  * ========================================================================== */
-
-void applyLeds(Level lv) {
-  digitalWrite(PIN_LED_G, lv == LV_AMAN);
-  digitalWrite(PIN_LED_Y, lv == LV_WASPADA);
-  digitalWrite(PIN_LED_R, lv == LV_BAHAYA || lv == LV_KRITIS);
-}
 
 void updateBuzzer(unsigned long now) {
   unsigned long period = 0, onMs = 0;
@@ -289,34 +470,65 @@ void updateBuzzer(unsigned long now) {
   else if (!on && bzState) { noTone(PIN_BUZZER);     bzState = false; }
 }
 
+/*
+ * OLED adalah satu-satunya indikator visual, sehingga tata letaknya dibuat
+ * mengikuti panel instrumen. Layar 128x64 piksel, font bawaan 6x8 px per
+ * karakter (size 1) dan 12x16 px (size 2):
+ *
+ *   y  0.. 7 : judul "CO-Zero" + status W:OK M:OK
+ *   y  8..27 : pita status, teks size 2 (dibalik untuk BAHAYA/KRITIS)
+ *   y 29..37 : kadar CO dalam ppm
+ *   y 40..47 : bar skala relatif terhadap ambang KRITIS
+ *   y 50..58 : suhu, kelembapan, dan flag lingkungan (rata kanan)
+ */
 void drawOled() {
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
 
-  /* baris 1: judul + level */
+  /* --- judul + status jaringan (maks 7 + 9 karakter x 6 px = 96 px) --- */
   oled.setTextSize(1);
   oled.setCursor(0, 0);
-  oled.print(F("CO-Zero | Kabin"));
-
-  oled.setTextSize(2);
-  oled.setCursor(0, 10);
-  oled.print(LEVEL_NAME[level]);
-
-  /* baris 2: kadar CO */
-  oled.setTextSize(1);
-  oled.setCursor(0, 30);
-  oled.printf("CO  : %6.1f ppm", ppmAvg);
-
-  /* baris 3: suhu & kelembapan */
-  oled.setCursor(0, 40);
-  if (dhtOk) oled.printf("Suhu: %4.1f C  RH: %2.0f%%", tempC, humPct);
-  else       oled.print(F("Suhu: --      RH: --"));
-
-  /* baris 4: status jaringan */
-  oled.setCursor(0, 50);
-  oled.printf("WiFi:%s MQTT:%s",
+  oled.print(F("CO-Zero"));
+  oled.setCursor(66, 0);
+  oled.printf("W:%s M:%s",
                WiFi.status() == WL_CONNECTED ? "OK" : "--",
                mqtt.connected() ? "OK" : "--");
+
+  /* --- pita status: teks dibalik (putih di atas hitam) saat berbahaya --- */
+  bool alertStyle = (level >= LV_BAHAYA);
+  oled.fillRect(0, 8, 128, 20, alertStyle ? SSD1306_WHITE : SSD1306_BLACK);
+  oled.setTextColor(alertStyle ? SSD1306_BLACK : SSD1306_WHITE);
+  oled.setTextSize(2);
+  oled.setCursor(2, 10);
+  oled.print(LEVEL_NAME[level]);
+  oled.setTextColor(SSD1306_WHITE);
+
+  /* --- kadar CO --- */
+  oled.setTextSize(1);
+  oled.setCursor(0, 29);
+  oled.printf("CO: %6.2f ppm", ppmAvg);
+
+  /* --- bar skala 0..TH_KRITIS --- */
+  int barW = (int)((ppmAvg / (float)TH_KRITIS) * 126.0f);
+  if (barW < 0)   barW = 0;
+  if (barW > 126) barW = 126;
+  oled.drawRect(0, 40, 128, 8, SSD1306_WHITE);
+  if (barW > 0) oled.fillRect(1, 41, barW, 6, SSD1306_WHITE);
+
+  /*
+   * --- suhu, kelembapan, dan flag lingkungan ---
+   * Flag dicetak rata kanan agar perubahan kondisi kabin langsung terlihat
+   * sebagai penyebab kenaikan level. Bila sensor gagal dibaca, nilai diganti
+   * tanda "--" dan flag menjadi "NO DHT"; klasifikasi lingkungan otomatis
+   * dilewati sehingga tidak terjadi eskalasi palsu.
+   */
+  oled.setCursor(0, 50);
+  if (dhtOk) oled.printf("%.1fC %.0f%%RH", tempC, humPct);
+  else       oled.print(F("--.-C  --%RH"));
+
+  const char* flag = dhtOk ? ENV_NAME[envFlag] : "NO DHT";
+  oled.setCursor(128 - (int)strlen(flag) * 6, 50);
+  oled.print(flag);
 
   oled.display();
 }
@@ -337,6 +549,7 @@ void ensureWifi() {
 }
 
 void ensureMqtt() {
+  if (!mqttConfigured) return;          // kredensial masih placeholder
   if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
 
   unsigned long now = millis();
@@ -364,31 +577,45 @@ void ensureMqtt() {
 void publishTelemetry() {
   if (!mqtt.connected()) return;
 
-  char payload[240];
+  char payload[320];
   snprintf(payload, sizeof(payload),
-           "{\"device_id\":\"%s\",\"co_ppm\":%.1f,\"temp_c\":%.1f,\"rh\":%.1f,"
-           "\"level\":\"%s\",\"level_code\":%d,\"raw\":%d,\"volt\":%.2f,"
-           "\"dout\":%d,\"uptime_s\":%lu}",
+           "{\"device_id\":\"%s\",\"co_ppm\":%.2f,\"temp_c\":%.1f,\"rh\":%.1f,"
+           "\"dht_ok\":%s,\"level\":\"%s\",\"level_code\":%d,"
+           "\"co_level\":\"%s\",\"env\":\"%s\",\"env_extreme\":%s,"
+           "\"raw\":%d,\"volt\":%.3f,\"dout\":%d,\"uptime_s\":%lu}",
            DEVICE_ID, ppmAvg, tempC, humPct,
-           LEVEL_NAME[level], (int)level, lastRawAdc, lastVoltOut,
+           dhtOk ? "true" : "false",
+           LEVEL_NAME[level], (int)level,
+           LEVEL_NAME[coLevel],
+           dhtOk ? ENV_NAME[envFlag] : "NORMAL",
+           (dhtOk && envFlag != ENV_NORMAL) ? "true" : "false",
+           lastRawAdc, lastVoltOut,
            mqDoutLow ? 0 : 1, (millis() - bootMillis) / 1000UL);
 
   mqtt.publish(TOPIC_TELEMETRY, payload);
 }
 
-void publishAlert(Level prev) {
+/*
+ * Alasan transisi dicatat agar penerima dapat membedakan apakah kenaikan level
+ * dipicu oleh kadar CO, kondisi lingkungan, atau keluaran digital sensor.
+ */
+void publishAlert(Level prev, const char* reason) {
   if (!mqtt.connected()) return;
 
-  char payload[180];
+  char payload[220];
   snprintf(payload, sizeof(payload),
            "{\"device_id\":\"%s\",\"prev\":\"%s\",\"level\":\"%s\","
-           "\"co_ppm\":%.1f,\"uptime_s\":%lu}",
-           DEVICE_ID, LEVEL_NAME[prev], LEVEL_NAME[level],
-           ppmAvg, (millis() - bootMillis) / 1000UL);
+           "\"reason\":\"%s\",\"co_ppm\":%.2f,\"co_level\":\"%s\","
+           "\"env\":\"%s\",\"uptime_s\":%lu}",
+           DEVICE_ID, LEVEL_NAME[prev], LEVEL_NAME[level], reason,
+           ppmAvg, LEVEL_NAME[coLevel],
+           dhtOk ? ENV_NAME[envFlag] : "NORMAL",
+           (millis() - bootMillis) / 1000UL);
 
   mqtt.publish(TOPIC_ALERT, payload);
-  Serial.printf("[ALERT] %s -> %s (%.1f ppm)\n",
-                LEVEL_NAME[prev], LEVEL_NAME[level], ppmAvg);
+  Serial.printf("[ALERT] %s -> %s (%s, %.2f ppm, %s)\n",
+                LEVEL_NAME[prev], LEVEL_NAME[level], reason,
+                ppmAvg, dhtOk ? ENV_NAME[envFlag] : "NO-DHT");
 }
 
 /* ==========================================================================
@@ -413,9 +640,11 @@ void handleSerial() {
 
       if (cmd == "?") {
         printCalState();
+      } else if (cmd == "dht") {
+        printDhtState();
       } else if (cmd == "r" || cmd == "reset") {
-        ppmPerVolt = PPM_PER_VOLT_DEFAULT;
-        baselineVolt = BASELINE_VOLT_DEFAULT;
+        vPerDecade = V_PER_DECADE_DEFAULT;
+        vAt1ppm    = V_AT_1PPM_DEFAULT;
         calPpm[0] = calPpm[1] = NAN;
         calVolt[0] = calVolt[1] = NAN;
         Serial.println(F("[CAL] Dikembalikan ke nilai default."));
@@ -431,7 +660,8 @@ void handleSerial() {
           }
         }
         if (!ok) {
-          Serial.println(F("[CMD] Tidak dikenal. Gunakan: c1 <ppm> | c2 <ppm> | r | ?"));
+          Serial.println(F("[CMD] Tidak dikenal. Gunakan: c1 <ppm> | c2 <ppm> "
+                           "| dht | r | ?"));
         }
       }
       continue;
@@ -456,41 +686,143 @@ void sampleSensors() {
   /* redundansi: keluaran digital MQ-2 (LOW = melewati ambang potensiometer) */
   mqDoutLow = (digitalRead(PIN_MQ_DOUT) == LOW);
 
+  Level   coPrev  = coLevel;
+  EnvFlag envPrev = envFlag;
+
+  coLevel = classify(ppmAvg, coLevel);
+  envFlag = envCheck(tempC, humPct, dhtOk, envFlag);
+
   Level prev = level;
-  level = classify(ppmAvg, level);
+  level = combineLevels(coLevel, envFlag);
 
   /*
    * DOUT sebagai penguat keputusan (hardware comparator).
-   * Hanya boleh MENAIKKAN level, dan hanya jika pembacaan analog sudah
-   * menunjukkan peningkatan. Ini mencegah DOUT yang "nyangkut" LOW
-   * memaksa status BAHAYA saat udara kabin masih bersih.
+   *
+   * Dua syarat harus terpenuhi sebelum DOUT boleh menaikkan level:
+   *   1. tegangan AOUT sudah melewati ambang komparator (DOUT_THRESHOLD_V),
+   *      sehingga DOUT yang tertahan LOW karena kabel lepas tidak memicu
+   *      BAHAYA palsu;
+   *   2. pembacaan analog sudah mencapai WASPADA.
+   * Keduanya membuat DOUT hanya memperkuat keputusan, tidak pernah
+   * bertentangan dengan jalur analog.
    */
-  if (mqDoutLow && ppmAvg >= TH_WASPADA && level < LV_BAHAYA) {
+  if (mqDoutLow && lastVoltOut >= DOUT_THRESHOLD_V
+      && ppmAvg >= TH_WASPADA && level < LV_BAHAYA) {
     level = LV_BAHAYA;
   }
 
   if (level != prev) {
-    publishAlert(prev);
+    const char* reason = (coLevel != coPrev) ? "co"
+                       : (envFlag != envPrev) ? "env"
+                       : "dout";
+    publishAlert(prev, reason);
   }
 
-  applyLeds(level);
+  /*
+   * Serial Monitor: jendela debugging. Kolom "i" adalah nilai sesaat sebelum
+   * dirata-rata, "raw" nilai ADC mentah, dan "V" tegangan keluaran sensor.
+   * Bagian setelah tanda "|" memuat suhu, kelembapan, flag lingkungan, lalu
+   * level CO dan level akhir. Panjang baris dijaga di bawah 94 karakter agar
+   * tidak terpotong pada Serial Monitor maupun pada dokumen laporan.
+   */
+  char envBuf[24];
+  if (dhtOk) {
+    snprintf(envBuf, sizeof(envBuf), "%4.1fC %4.1f%%RH %-6s",
+             tempC, humPct, ENV_NAME[envFlag]);
+  } else {
+    snprintf(envBuf, sizeof(envBuf), "DHT TIDAK TERBACA    ");
+  }
 
-  /* Serial Monitor: jendela debugging */
-  Serial.printf("[%6lu ms] CO=%6.1f ppm (raw=%4d Vout=%.2fV dout=%d) | "
-                "%4.1fC %2.0f%% | %s\n",
-                millis(), ppmAvg, lastRawAdc, lastVoltOut, mqDoutLow ? 0 : 1,
-                tempC, humPct, LEVEL_NAME[level]);}
+  Serial.printf("[%6lu ms] CO=%6.2f i=%6.2f raw=%4d V=%.3f d=%d | %s | %s->%s\n",
+                millis(), ppmAvg, ppmRaw, lastRawAdc, lastVoltOut,
+                mqDoutLow ? 0 : 1, envBuf,
+                LEVEL_NAME[coLevel], LEVEL_NAME[level]);
+}
 
+/*
+ * Pembacaan DHT22.
+ *
+ * Catatan penting mengenai library DHTesp:
+ *   - readSensor() menolak pembacaan yang berjarak kurang dari 1999 ms dan
+ *     langsung kembali TANPA memperbarui status. Karena itu percobaan ulang
+ *     berjarak dekat tidak berguna; satu percobaan per siklus DHT_MS (2200 ms)
+ *     sudah merupakan laju maksimum yang diizinkan sensor.
+ *   - getStatus() hanya mengembalikan ERROR_NONE, ERROR_TIMEOUT, atau
+ *     ERROR_CHECKSUM. TIMEOUT berarti jalur data tidak merespons sama sekali
+ *     (indikasi wiring), sedangkan CHECKSUM berarti sensor merespons tetapi
+ *     data rusak.
+ *
+ * Nilai yang gagal dibaca TIDAK dipertahankan. Variabel ditandai tidak valid
+ * (dhtOk = false) agar antarmuka menampilkan tanda "--" dan bukan angka lama
+ * yang menyesatkan.
+ */
 void readDht() {
   TempAndHumidity th = dht.getTempAndHumidity();
+
   if (dht.getStatus() == DHTesp::ERROR_NONE) {
-    tempC = th.temperature;
-    humPct = th.humidity;
+    tempC   = th.temperature;
+    humPct  = th.humidity;
+    dhtOkAt = millis();
+
+    if (!dhtOk) {
+      if (dhtFail > 0) {
+        Serial.printf("[DHT] Terbaca kembali setelah %u kegagalan.\n", dhtFail);
+      }
+      Serial.printf("[DHT] OK: %.1f C, %.1f %%RH\n", tempC, humPct);
+      dhtFail = 0;
+    }
     dhtOk = true;
-  } else {
-    dhtOk = false;
-    Serial.printf("[DHT] gagal baca: %s\n", dht.getStatusString());
+    return;
   }
+
+  dhtOk = false;
+  dhtFail++;
+
+  /* Laporan dibatasi 5 detik sekali agar Serial Monitor tidak dipenuhi. */
+  static unsigned long lastWarn = 0;
+  if (millis() - lastWarn < 5000UL) return;
+  lastWarn = millis();
+
+  Serial.printf("[DHT] Gagal baca #%u: %s\n", dhtFail, dht.getStatusString());
+  if (strcmp(dht.getStatusString(), "TIMEOUT") == 0) {
+    Serial.printf("[DHT] Jalur data tidak merespons. Periksa tiga kabel: "
+                  "VCC->3V3, SDA->D%d, GND->GND.\n", PIN_DHT);
+    Serial.println(F("[DHT] Pastikan SDA tidak terpasang pada pad NC."));
+  } else {
+    Serial.println(F("[DHT] Data rusak (checksum). Pembacaan akan diulang otomatis."));
+  }
+}
+
+/*
+ * Uji awal sensor saat boot, dijalankan SEBELUM WiFi aktif agar pembacaan
+ * tidak terganggu aktivitas radio. Hasilnya dicetak lengkap sehingga
+ * kegagalan wiring langsung terlihat pada Serial Monitor.
+ */
+void dhtSelfTest() {
+  Serial.printf("[DHT] Uji awal sensor (maksimum %d percobaan)...\n", DHT_BOOT_TRIES);
+
+  for (int i = 1; i <= DHT_BOOT_TRIES; i++) {
+    delay(2200);
+    TempAndHumidity th = dht.getTempAndHumidity();
+
+    if (dht.getStatus() == DHTesp::ERROR_NONE) {
+      tempC   = th.temperature;
+      humPct  = th.humidity;
+      dhtOk   = true;
+      dhtOkAt = millis();
+      Serial.printf("[DHT] Percobaan %d/%d: OK -> %.1f C, %.1f %%RH\n",
+                    i, DHT_BOOT_TRIES, tempC, humPct);
+      return;
+    }
+    Serial.printf("[DHT] Percobaan %d/%d: %s\n",
+                  i, DHT_BOOT_TRIES, dht.getStatusString());
+  }
+
+  dhtOk = false;
+  Serial.println(F("[DHT] Sensor tidak merespons. Sistem tetap berjalan dengan "
+                   "level CO saja."));
+  Serial.printf("[DHT] Periksa wiring: VCC->3V3, SDA->D%d, GND->GND "
+                "(pad ketiga bertanda NC tidak terpakai).\n", PIN_DHT);
 }
 
 void setup() {
@@ -505,13 +837,8 @@ void setup() {
   Serial.println(F("=============================================="));
 
   /* output */
-  pinMode(PIN_LED_G, OUTPUT);
-  pinMode(PIN_LED_Y, OUTPUT);
-  pinMode(PIN_LED_R, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_LED_G, HIGH);   // boot: hijau
-  digitalWrite(PIN_LED_Y, LOW);
-  digitalWrite(PIN_LED_R, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
 
   /* input */
   pinMode(PIN_MQ_DOUT, INPUT);
@@ -530,22 +857,38 @@ void setup() {
     oled.display();
   }
 
-  /* DHT22 */
+  /* DHT22: uji awal dijalankan sebelum WiFi agar tidak terganggu aktivitas radio */
   dht.setup(PIN_DHT, DHTesp::DHT22);
+  dhtSelfTest();
 
   /* Skala sensor: nilai default, dapat dikalibrasi lewat Serial Monitor */
-  ppmPerVolt = PPM_PER_VOLT_DEFAULT;
-  baselineVolt = BASELINE_VOLT_DEFAULT;
-  Serial.printf("[CAL] Skala awal: %.1f ppm/V, baseline %.3f V\n",
-                ppmPerVolt, baselineVolt);
-  Serial.println(F("[CAL] Butuh kalibrasi? Geser slider lalu ketik: c1 <ppm>, c2 <ppm>, ?"));
+  vPerDecade = V_PER_DECADE_DEFAULT;
+  vAt1ppm    = V_AT_1PPM_DEFAULT;
+  Serial.printf("[CAL] Skala log: %.4f V/dekade, 1 ppm = %.4f V\n",
+                vPerDecade, vAt1ppm);
+  Serial.println(F("[CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht"));
+  Serial.println(F("[INFO] Kolom: CO=ppm i=instan raw=ADC V=volt d=DOUT"));
+  Serial.println(F("[INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | AMAN->AMAN"));
 
   /* Jaringan */
   ensureWifi();
-  net.setInsecure();                 // simplifikasi simulasi, lihat catatan laporan
+  net.setInsecure();                 // penyederhanaan simulasi, lihat catatan laporan
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setBufferSize(512);
   mqtt.setKeepAlive(30);
+
+  /*
+   * Bila MQTT_HOST masih berupa placeholder "xxxxxxxxxxxx...", MQTT dimatikan
+   * agar Serial Monitor tidak dipenuhi pesan "GAGAL (rc=5)". Seluruh fitur
+   * lokal (sensor, OLED, buzzer) tetap berjalan normal.
+   */
+  mqttConfigured = (strncmp(MQTT_HOST, "xxxx", 4) != 0);
+  if (mqttConfigured) {
+    Serial.printf("[MQTT] Broker: %s:%d\n", MQTT_HOST, MQTT_PORT);
+  } else {
+    Serial.println(F("[MQTT] Kredensial HiveMQ belum diisi -> MQTT nonaktif."));
+    Serial.println(F("[MQTT] Fitur lokal (OLED/buzzer) tetap berjalan."));
+  }
 }
 
 void loop() {

@@ -1,0 +1,23 @@
+# Artefak Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Data hasil pengujian (dihasilkan dashboard, tidak perlu masuk repositori)
+dashboard/data/
+*.csv
+
+# Berkas sementara perkakas dokumen
+~$*.docx
+*.pdf
+*.png.tmp
+
+# Berkas sistem
+.DS_Store
+Thumbs.db
+
+# Konfigurasi editor
+.vscode/
+.idea/
