@@ -810,7 +810,7 @@ void readDht() {
   Serial.printf("[DHT] Gagal baca #%u: %s\n", dhtFail, dht.getStatusString());
   if (strcmp(dht.getStatusString(), "TIMEOUT") == 0) {
     Serial.printf("[DHT] Jalur data tidak merespons. Periksa tiga kabel: "
-                  "VCC->3V3, SDA->D%d, GND->GND.\n", PIN_DHT);
+                  "VCC->3V3, SDA->D%d, GND->GND.\n", dhtActivePin);
     Serial.println(F("[DHT] Pastikan SDA tidak terpasang pada pad NC."));
   } else {
     Serial.println(F("[DHT] Data rusak (checksum). Pembacaan akan diulang otomatis."));
@@ -865,7 +865,7 @@ void dhtSelfTest() {
   Serial.println(F("[DHT] Sensor tidak ditemukan. Sistem tetap berjalan dengan "
                    "level CO saja."));
   Serial.printf("[DHT] Periksa wiring: VCC->3V3, SDA->D%d, GND->GND "
-                "(pad ketiga bertanda NC tidak terpakai).\n", PIN_DHT);
+                "(pad ketiga bertanda NC tidak terpakai).\n", dhtActivePin);
 }
 
 /*
