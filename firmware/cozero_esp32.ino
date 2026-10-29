@@ -35,7 +35,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <DHTesp.h>
+#include <DHT.h>
 
 /* ==========================================================================
  *  1. KONFIGURASI  (ubah bagian ini saja)
@@ -63,6 +63,7 @@
 #define PIN_MQ_ADC      34   // ADC1_CH6, input-only
 #define PIN_MQ_DOUT     32   // keluaran digital MQ-2 (redundan)
 #define PIN_DHT         4
+#define DHTTYPE         DHT22
 #define PIN_BUZZER      25
 #define PIN_OLED_SDA    21
 #define PIN_OLED_SCL    22
@@ -169,7 +170,7 @@
  * ========================================================================== */
 
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
-DHTesp dht;
+DHT dht(PIN_DHT, DHTTYPE);
 WiFiClientSecure net;
 PubSubClient mqtt(net);
 
@@ -764,7 +765,7 @@ void sampleSensors() {
 /*
  * Pembacaan DHT22.
  *
- * Catatan penting mengenai library DHTesp:
+ * Catatan penting mengenai library DHT (Adafruit):
  *   - readSensor() menolak pembacaan yang berjarak kurang dari 1999 ms dan
  *     langsung kembali TANPA memperbarui status. Karena itu percobaan ulang
  *     berjarak dekat tidak berguna; satu percobaan per siklus DHT_MS (2200 ms)
@@ -779,11 +780,12 @@ void sampleSensors() {
  * yang menyesatkan.
  */
 void readDht() {
-  TempAndHumidity th = dht.getTempAndHumidity();
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
 
-  if (dht.getStatus() == DHTesp::ERROR_NONE) {
-    tempC   = th.temperature;
-    humPct  = th.humidity;
+  if (!isnan(t) && !isnan(h)) {
+    tempC   = t;
+    humPct  = h;
     dhtOkAt = millis();
     dhtLastErr = "OK";
 
@@ -800,15 +802,15 @@ void readDht() {
 
   dhtOk = false;
   dhtFail++;
-  dhtLastErr = dht.getStatusString();
+  dhtLastErr = "TIMEOUT";
 
   /* Laporan dibatasi 5 detik sekali agar Serial Monitor tidak dipenuhi. */
   static unsigned long lastWarn = 0;
   if (millis() - lastWarn < 5000UL) return;
   lastWarn = millis();
 
-  Serial.printf("[DHT] Gagal baca #%u: %s\n", dhtFail, dht.getStatusString());
-  if (strcmp(dht.getStatusString(), "TIMEOUT") == 0) {
+  Serial.printf("[DHT] Gagal baca #%u: %s\n", dhtFail, dhtLastErr);
+  if (strcmp(dhtLastErr, "TIMEOUT") == 0) {
     Serial.printf("[DHT] Jalur data tidak merespons. Periksa tiga kabel: "
                   "VCC->3V3, SDA->D%d, GND->GND.\n", dhtActivePin);
     Serial.println(F("[DHT] Pastikan SDA tidak terpasang pada pad NC."));
@@ -828,11 +830,12 @@ void dhtSelfTest() {
 
   for (int i = 1; i <= DHT_BOOT_TRIES; i++) {
     delay(2200);
-    TempAndHumidity th = dht.getTempAndHumidity();
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
 
-    if (dht.getStatus() == DHTesp::ERROR_NONE) {
-      tempC   = th.temperature;
-      humPct  = th.humidity;
+    if (!isnan(t) && !isnan(h)) {
+      tempC   = t;
+      humPct  = h;
       dhtOk   = true;
       dhtOkAt = millis();
       dhtLastErr = "OK";
@@ -840,7 +843,7 @@ void dhtSelfTest() {
                     i, DHT_BOOT_TRIES, tempC, humPct);
       return;
     }
-    dhtLastErr = dht.getStatusString();
+    dhtLastErr = "TIMEOUT";
     Serial.printf("[DHT] Percobaan %d/%d: %s\n",
                   i, DHT_BOOT_TRIES, dhtLastErr);
   }
@@ -941,14 +944,16 @@ void dhtProbe() {
  * menunggu jeda 2 detik.
  */
 bool dhtTryPin(uint8_t pin, float &t, float &h) {
-  dht.setup(pin, DHTesp::DHT22);
-  delay(10);
+  DHT testDht(pin, DHTTYPE);
+  testDht.begin();
+  delay(50);
 
-  TempAndHumidity th = dht.getTempAndHumidity();
-  if (dht.getStatus() != DHTesp::ERROR_NONE) return false;
+  float temp = testDht.readTemperature(false, true);
+  float hum  = testDht.readHumidity(true);
+  if (isnan(temp) || isnan(hum)) return false;
 
-  t = th.temperature;
-  h = th.humidity;
+  t = temp;
+  h = hum;
   return true;
 }
 
@@ -997,7 +1002,7 @@ int dhtScan(bool adopt) {
       if (ketemu < 0) ketemu = p;
     } else if (!adopt) {
       Serial.printf("  GPIO%-2d : %-8s (pu=%d pd=%d)\n",
-                    p, dht.getStatusString(), hi, lo);
+                    p, "TIMEOUT", hi, lo);
       if (pulldownValid && hi == 1 && lo == 1 && ditahanHigh < 0) {
         ditahanHigh = p;
       }
@@ -1006,6 +1011,8 @@ int dhtScan(bool adopt) {
 
   if (ketemu >= 0 && adopt) {
     dhtActivePin = (uint8_t)ketemu;
+    dht = DHT(dhtActivePin, DHTTYPE);
+    dht.begin();
     float t, h;
     if (dhtTryPin(dhtActivePin, t, h)) {
       tempC   = t;
@@ -1017,7 +1024,8 @@ int dhtScan(bool adopt) {
     }
   } else if (ketemu < 0) {
     /* Tidak ada yang berhasil: kembalikan library ke pin semula. */
-    dht.setup(dhtActivePin, DHTesp::DHT22);
+    dht = DHT(dhtActivePin, DHTTYPE);
+    dht.begin();
     dhtOk = false;
   }
 
@@ -1082,7 +1090,8 @@ void setup() {
 
   /* DHT22: uji awal dijalankan sebelum WiFi agar tidak terganggu aktivitas radio */
   dhtActivePin = PIN_DHT;
-  dht.setup(dhtActivePin, DHTesp::DHT22);
+  dht = DHT(dhtActivePin, DHTTYPE);
+  dht.begin();
   dhtSelfTest();
 
   /* Skala sensor: nilai default, dapat dikalibrasi lewat Serial Monitor */

@@ -21,3 +21,5 @@ Thumbs.db
 # Konfigurasi editor
 .vscode/
 .idea/
+
+CONVERSATION_LOG.md
