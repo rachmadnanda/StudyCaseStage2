@@ -460,6 +460,30 @@ Level combineLevels(Level co, EnvFlag env) {
   if (co >= LV_KRITIS)   return LV_KRITIS;
   return (Level)((int)co + 1);
 }
+
+// Keterangan singkat penyebab status untuk OLED dan Serial Monitor.
+const char* getAlertReason() {
+  if (level == LV_AMAN) return "NORMAL";
+
+  // Jika level akhir lebih tinggi dari level CO, lingkungan memperberat status.
+  if (level > coLevel) {
+    if (envFlag == ENV_PANAS)  return "SUHU PANAS";
+    if (envFlag == ENV_LEMBAB) return "RH TINGGI";
+    if (envFlag == ENV_KERING) return "RH RENDAH";
+  }
+
+  // DOUT hanya menjadi penguat jika kondisi analog juga memenuhi syarat.
+  if (mqDoutLow && lastVoltOut >= DOUT_THRESHOLD_V && ppmAvg >= TH_WASPADA)
+    return "CO + DOUT";
+
+  switch (coLevel) {
+    case LV_WASPADA: return "CO MENINGKAT";
+    case LV_BAHAYA:  return "CO TINGGI";
+    case LV_KRITIS:  return "CO KRITIS";
+    default:         return "PERIKSA SENSOR";
+  }
+}
+
 // ==LOGIC-ENV-END==
 
 /* ==========================================================================
@@ -742,10 +766,11 @@ void sampleSensors() {
   }
 
   /*
-   * Serial Monitor: jendela debugging. Kolom "i" adalah nilai sesaat sebelum
-   * dirata-rata, "raw" nilai ADC mentah, dan "V" tegangan keluaran sensor.
-   * Bagian setelah tanda "|" memuat suhu, kelembapan, flag lingkungan, lalu
-   * level CO dan level akhir. Panjang baris dijaga di bawah 94 karakter agar
+   * Serial Monitor: jendela debugging. "KADAR_CO" adalah kadar CO hasil
+   * pengolahan (moving average) beserta levelnya, "raw" nilai ADC mentah, dan
+   * "V" tegangan keluaran sensor. Bagian setelah tanda "|" memuat suhu,
+   * kelembapan, dan flag lingkungan, lalu level akhir sistem ("STATUS") beserta
+   * penyebabnya ("ALASAN"). Panjang baris dijaga di bawah 120 karakter agar
    * tidak terpotong pada Serial Monitor maupun pada dokumen laporan.
    */
   char envBuf[24];
@@ -756,10 +781,9 @@ void sampleSensors() {
     snprintf(envBuf, sizeof(envBuf), "DHT TIDAK TERBACA    ");
   }
 
-  Serial.printf("[%6lu ms] CO=%6.2f i=%6.2f raw=%4d V=%.3f d=%d | %s | %s->%s\n",
-                millis(), ppmAvg, ppmRaw, lastRawAdc, lastVoltOut,
-                mqDoutLow ? 0 : 1, envBuf,
-                LEVEL_NAME[coLevel], LEVEL_NAME[level]);
+  Serial.printf("[%6lu ms] KADAR_CO=%6.2fppm LEVEL_CO=%s | raw=%4d V=%.3f d=%d | %s | STATUS=%s | ALASAN=%s\n",
+                millis(), ppmAvg, LEVEL_NAME[coLevel], lastRawAdc, lastVoltOut,
+                mqDoutLow ? 0 : 1, envBuf, LEVEL_NAME[level], getAlertReason());
 }
 
 /*
@@ -1100,8 +1124,8 @@ void setup() {
   Serial.printf("[CAL] Skala log: %.4f V/dekade, 1 ppm = %.4f V\n",
                 vPerDecade, vAt1ppm);
   Serial.println(F("[CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht, scan"));
-  Serial.println(F("[INFO] Kolom: CO=ppm i=instan raw=ADC V=volt d=DOUT"));
-  Serial.println(F("[INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | AMAN->AMAN"));
+  Serial.println(F("[INFO] Kolom: KADAR_CO=ppm LEVEL_CO=status | raw=ADC V=volt d=DOUT"));
+  Serial.println(F("[INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | STATUS=KRITIS | ALASAN=CO KRITIS"));
 
   /* Jaringan */
   ensureWifi();

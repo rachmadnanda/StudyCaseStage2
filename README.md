@@ -205,17 +205,30 @@ Serial Monitor akan menampilkan:
 [DHT] Percobaan 1/3: OK -> 29.0 C, 61.0 %RH
 [CAL] Skala log: 0.6836 V/dekade, 1 ppm = 1.3629 V
 [CAL] Kalibrasi: c1 <ppm>, c2 <ppm>, ? | Diagnosa: dht, scan
-[INFO] Kolom: CO=ppm i=instan raw=ADC V=volt d=DOUT
-[INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | AMAN->AMAN
+[INFO] Kolom: KADAR_CO=ppm LEVEL_CO=status | raw=ADC V=volt d=DOUT
+[INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | STATUS=KRITIS | ALASAN=CO KRITIS
 [WiFi] Menghubungkan ke Wokwi-GUEST ...
 [MQTT] Connect ke abc123def.s1.eu.hivemq.cloud:8883 ... OK
-[  3210 ms] CO=  0.10 i=  0.10 raw= 843 V=0.679 d=1 | 29.0C 61.0%RH NORMAL | AMAN->AMAN
+[  3210 ms] KADAR_CO=  0.10ppm LEVEL_CO=AMAN | raw= 843 V=0.679 d=1 | 29.0C 61.0%RH NORMAL | STATUS=AMAN | ALASAN=NORMAL
 ```
 
-Baris terakhir memuat seluruh informasi keputusan: nilai ppm hasil pengolahan (`CO`),
-nilai sesaat sebelum dirata-rata (`i`), ADC mentah (`raw`), tegangan sensor (`V`), status
-DOUT (`d`), suhu dan kelembapan beserta flag lingkungan, lalu level CO dan level akhir
-yang dipisahkan tanda `->`.
+Baris terakhir memuat seluruh informasi keputusan: kadar CO hasil pengolahan
+(`KADAR_CO`) beserta level CO-nya (`LEVEL_CO`), ADC mentah (`raw`), tegangan sensor
+(`V`), status DOUT (`d`), suhu dan kelembapan beserta flag lingkungan, level akhir
+sistem (`STATUS`), lalu penyebab status tersebut (`ALASAN`).
+
+Kolom `ALASAN` menjelaskan mengapa level akhir berbunyi demikian:
+
+| Nilai `ALASAN`             | Arti                                                       |
+| ---------------------------- | ------------------------------------------------------------ |
+| `NORMAL`                   | Kadar CO dan iklim kabin masih aman                        |
+| `CO MENINGKAT`             | Level CO mencapai WASPADA (≥ 20 ppm)                       |
+| `CO TINGGI`                | Level CO mencapai BAHAYA (≥ 35 ppm)                        |
+| `CO KRITIS`                | Level CO mencapai KRITIS (≥ 115 ppm)                       |
+| `SUHU PANAS`               | Suhu ≥ 40 °C memperberat level CO satu tingkat             |
+| `RH TINGGI` / `RH RENDAH` | Kelembapan di luar rentang nyaman memperberat level CO     |
+| `CO + DOUT`                | Keluaran digital MQ-2 ikut mengonfirmasi kondisi berbahaya |
+| `PERIKSA SENSOR`           | Level tidak wajar, kemungkinan jalur sensor bermasalah     |
 
 Jika muncul `MQTT ... GAGAL`, periksa username dan password serta pastikan cluster aktif.
 Jika angka CO tidak sesuai dengan slider, lakukan kalibrasi pada bagian 7.
