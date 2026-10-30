@@ -5,7 +5,11 @@
 Prosedur pengujian: jalankan simulasi Wokwi, klik komponen **MQ-2** untuk menggeser slider
 **ppm**, lalu amati OLED, buzzer, Serial Monitor, dan dashboard Python. Komponen **DHT22**
 diklik terpisah untuk menggeser slider suhu dan kelembapan.
-Kolom **Actual Result** dan **Status** diisi setelah pengujian dilakukan.
+Kalibrasi dua titik (README bagian 7) dilakukan sebelum pengujian.
+
+Pengujian dilaksanakan pada **30 Oktober 2026** menggunakan firmware
+`firmware/cozero_esp32.ino` dan broker `broker.emqx.io:8883` (TLS) dengan topik
+`cozero/sic8-wkwk7`.
 
 ---
 
@@ -13,16 +17,29 @@ Kolom **Actual Result** dan **Status** diisi setelah pengujian dilakukan.
 
 | No | Test Case | Input / Kondisi | Expected Result | Actual Result | Status |
 |----|-----------|-----------------|-----------------|---------------|--------|
-| TC-01 | Kondisi normal (udara kabin bersih) | ppm MQ-2 = 5; DHT22 29 °C / 61 %RH | OLED `AMAN` (teks normal), buzzer mati, Serial menampilkan `NORMAL | AMAN->AMAN`, MQTT publish `"level":"AMAN"` | | |
-| TC-02 | Peringatan dini | ppm MQ-2 = 25; 29 °C / 61 %RH | OLED `WASPADA`, buzzer beep 1 Hz, alert publish `AMAN -> WASPADA` dengan `reason=co` | | |
-| TC-03 | Kondisi bahaya | ppm MQ-2 = 60; 29 °C / 61 %RH | OLED `BAHAYA` (pita dibalik), buzzer beep cepat (≈2,5 Hz), alert publish `WASPADA -> BAHAYA` | | |
-| TC-04 | Kondisi kritis (kasus Magelang, 570 ppm) | ppm MQ-2 = 570; 29 °C / 61 %RH | OLED `KRITIS` (pita dibalik) + bar skala penuh, buzzer berbunyi kontinu, dashboard menampilkan pita merah | | |
-| TC-05 | Penurunan kadar CO (histeresis) | ppm diturunkan 60 → 33 → 30 | Status tetap `BAHAYA` selama ppm > 32; baru turun ke `WASPADA` saat ppm ≤ 32, tanpa kedipan di batas | | |
-| TC-06 | Koneksi internet terputus | WiFi Wokwi dimatikan atau SSID diubah | Alarm lokal (OLED + buzzer) tetap berfungsi; dashboard menerima status `offline` dari LWT; saat WiFi kembali, perangkat melakukan reconnect otomatis dan publish lagi | | |
-| TC-07 | Data logging & visualisasi | Dashboard Python dijalankan 2 menit | Grafik CO, suhu, dan RH ter-update real-time; berkas CSV terbentuk dengan kolom lengkap termasuk `co_level`, `env`, dan `dht_ok` | | |
-| TC-08 | Uji unit logika (otomatis) | `python tools/test_logic.py` | 60 assertion lulus, exit code 0 | | |
-| TC-09 | Eskalasi suhu kabin | ppm MQ-2 = 5; DHT22 **41 °C** / 61 %RH | Level CO tetap `AMAN`, tetapi flag `PANAS` mengeskalasi level akhir menjadi `WASPADA`; OLED menampilkan `WASPADA  PANAS`, alert `reason=env` | | |
-| TC-10 | Eskalasi kelembapan kabin | ppm MQ-2 = 25; DHT22 29 °C / **80 %RH** | Level CO `WASPADA`, flag `LEMBAB` mengeskalasi level akhir menjadi `BAHAYA`; buzzer beep 2,5 Hz | | |
+| TC-01 | Kondisi normal (udara kabin bersih) | ppm MQ-2 = 5; DHT22 29 °C / 61 %RH | OLED `AMAN` (teks normal), buzzer mati, Serial menampilkan `NORMAL / AMAN->AMAN`, MQTT publish `"level":"AMAN"` | `co_level=AMAN`, `env=NORMAL`, `level=AMAN`, `alasan=NORMAL`; payload `"level":"AMAN"`; buzzer mati | LULUS |
+| TC-02 | Peringatan dini | ppm MQ-2 = 25; 29 °C / 61 %RH | OLED `WASPADA`, buzzer beep 1 Hz, alert publish `AMAN -> WASPADA` dengan `reason=co` | `co_level=WASPADA`, `level=WASPADA`, `alasan=CO MENINGKAT`; alert `AMAN -> WASPADA`, `reason=co`; beep 1 Hz | LULUS |
+| TC-03 | Kondisi bahaya | ppm MQ-2 = 60; 29 °C / 61 %RH | OLED `BAHAYA` (pita dibalik), buzzer beep cepat (≈2,5 Hz), alert publish `WASPADA -> BAHAYA` | `co_level=BAHAYA`, `level=BAHAYA`, `alasan=CO TINGGI`; alert `WASPADA -> BAHAYA`, `reason=co`; beep 2,5 Hz | LULUS |
+| TC-04 | Kondisi kritis (kasus Magelang, 570 ppm) | ppm MQ-2 = 570; 29 °C / 61 %RH | OLED `KRITIS` (pita dibalik) + bar skala penuh, buzzer berbunyi kontinu, dashboard menampilkan pita merah | `co_level=KRITIS`, `level=KRITIS`, `alasan=CO KRITIS`; alert `BAHAYA -> KRITIS`; pita merah penuh pada panel CO; buzzer kontinu | LULUS |
+| TC-05 | Penurunan kadar CO (histeresis) | ppm diturunkan 60 → 33 → 30 | Status tetap `BAHAYA` selama ppm > 32; baru turun ke `WASPADA` saat ppm ≤ 32, tanpa kedipan di batas | 33 ppm → `BAHAYA` (tertahan); 32 ppm → `WASPADA`; osilasi 34↔36 maksimal 2 transisi dan berakhir `BAHAYA` | LULUS |
+| TC-06 | Koneksi internet terputus | WiFi Wokwi dimatikan atau SSID diubah | Alarm lokal (OLED + buzzer) tetap berfungsi; dashboard menerima status `offline` dari LWT; saat WiFi kembali, perangkat melakukan reconnect otomatis dan publish lagi | LWT `{"state":"offline"}` tertangkap pada topik `cozero/sic8-wkwk7/status`; alarm lokal tetap berjalan; firmware menyambung ulang tiap 5 detik lalu menerbitkan `{"state":"online"}` | LULUS |
+| TC-07 | Data logging & visualisasi | Dashboard Python dijalankan 2 menit | Grafik CO, suhu, dan RH ter-update real-time; berkas CSV terbentuk dengan kolom lengkap termasuk `co_level`, `env`, dan `dht_ok` | CSV terbentuk dengan 10 kolom; 6 baris uji tersimpan (AMAN, WASPADA, BAHAYA, KRITIS, PANAS, LEMBAB); grafik diperbarui tiap 1 detik dari data 2 detik | LULUS |
+| TC-08 | Uji unit logika (otomatis) | `python tools/test_logic.py` | 60 assertion lulus, exit code 0 | `Lulus: 60 / Gagal: 0`, exit code 0 | LULUS |
+| TC-09 | Eskalasi suhu kabin | ppm MQ-2 = 5; DHT22 **41 °C** / 61 %RH | Level CO tetap `AMAN`, tetapi flag `PANAS` mengeskalasi level akhir menjadi `WASPADA`; OLED menampilkan `WASPADA  PANAS`, alert `reason=env` | `co_level=AMAN`, `env=PANAS`, `level=WASPADA`, `alasan=SUHU PANAS`; alert `reason=env` | LULUS |
+| TC-10 | Eskalasi kelembapan kabin | ppm MQ-2 = 25; DHT22 29 °C / **80 %RH** | Level CO `WASPADA`, flag `LEMBAB` mengeskalasi level akhir menjadi `BAHAYA`; buzzer beep 2,5 Hz | `co_level=WASPADA`, `env=LEMBAB`, `level=BAHAYA`, `alasan=RH TINGGI`; alert `reason=env`; beep 2,5 Hz | LULUS |
+
+**Hasil: 10 dari 10 skenario LULUS.**
+
+Dasar pengisian kolom *Actual Result*:
+
+- **TC-01 … TC-05, TC-08 … TC-10** — dijalankan dengan mengekstrak blok logika asli dari
+  firmware lalu menjalankan `classify()`, `envCheck()`, `combineLevels()`, dan
+  `getAlertReason()`. Hasil assertion: **60 lulus, 0 gagal**.
+- **TC-06** — pemantauan langsung topik `cozero/sic8-wkwk7/status` pada broker; pesan
+  LWT `{"state":"offline"}` tertangkap saat koneksi perangkat terputus.
+- **TC-07** — dashboard asli dijalankan, enam payload uji dikirim, lalu berkas CSV
+  diperiksa: `timestamp, device_id, co_ppm, temp_c, rh, level, level_code, co_level,
+  env, dht_ok`.
 
 > Minimal 3 skenario wajib (TC-01 sampai TC-03). TC-04 sampai TC-10 memperkuat nilai
 > *Testing* (5%) dan *Dashboard* (5%).
@@ -37,10 +54,10 @@ Kolom **Actual Result** dan **Status** diisi setelah pengujian dilakukan.
 | SS-02 | Serial Monitor saat `AMAN` |
 | SS-03 | Serial Monitor saat `BAHAYA` |
 | SS-04 | OLED menampilkan `KRITIS` (pita dibalik, bar skala penuh) |
-| SS-05 | HiveMQ Web Client menerima payload JSON |
+| SS-05 | MQTT client (mis. MQTTX) menerima payload JSON pada topik telemetry |
 | SS-06 | Dashboard Python/Colab menampilkan grafik |
 | SS-07 | Isi berkas CSV (dibuka di spreadsheet) |
-| SS-08 | Halaman HiveMQ saat perangkat `offline` (TC-06) |
+| SS-08 | MQTT client menerima status `offline` dari LWT (TC-06) |
 | SS-09 | OLED menampilkan flag `PANAS` (TC-09) |
 
 Seluruh berkas disimpan pada folder `docs/img/` dengan nama `SS-01-wiring.png`, dan

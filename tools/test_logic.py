@@ -22,6 +22,17 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKETCH = os.path.join(ROOT, "firmware", "cozero_esp32.ino")
 
+# Disisipkan tepat setelah blok tipe (Level, EnvFlag) karena getAlertReason()
+# membaca state global ini. Nilainya tidak memengaruhi fungsi murni yang diuji.
+GLOBALS = r"""
+static Level   level       = LV_AMAN;
+static Level   coLevel     = LV_AMAN;
+static EnvFlag envFlag     = ENV_NORMAL;
+static bool    mqDoutLow   = false;
+static float   lastVoltOut = 0.0f;
+static float   ppmAvg      = 0.0f;
+"""
+
 HARNESS = r"""
 #include <cstdio>
 #include <cmath>
@@ -230,7 +241,7 @@ def main():
     if not types or not func:
         sys.exit("Penanda blok logika tidak ditemukan di sketch.")
 
-    logic = types.group(1) + "\n" + func.group(1)
+    logic = types.group(1) + "\n" + GLOBALS + "\n" + func.group(1)
 
     env = re.search(r"// ==LOGIC-ENV-BEGIN==(.*?)// ==LOGIC-ENV-END==", src, re.S)
     if not env:
@@ -248,7 +259,7 @@ def main():
         if re.match(
             r"#define\s+(TH_WASPADA|TH_BAHAYA|TH_KRITIS|HISTERESIS"
             r"|TH_TEMP_PANAS|TH_RH_LEMBAB|TH_RH_KERING"
-            r"|ENV_HYST_TEMP|ENV_HYST_RH"
+            r"|ENV_HYST_TEMP|ENV_HYST_RH|DOUT_THRESHOLD_V"
             r"|V_PER_DECADE_DEFAULT|V_AT_1PPM_DEFAULT)\s", line)
     )
     if not defines:
