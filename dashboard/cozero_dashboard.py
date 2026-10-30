@@ -4,8 +4,9 @@ CO-Zero Dashboard - Monitoring CO Kabin Mobil
 Samsung Innovation Campus Batch 8 - Stage 2
 Tim Iki jenenge wes wkwk - Politeknik Negeri Malang
 
-Menerima data telemetri dari ESP32 (Wokwi) melalui MQTT HiveMQ Cloud,
-menampilkan grafik real-time (Matplotlib), dan menyimpan log ke CSV.
+Menerima data telemetri dari ESP32 (Wokwi) melalui MQTT (broker publik
+EMQX secara default), menampilkan grafik real-time (Matplotlib), dan
+menyimpan log ke CSV.
 
 Kedua panel grafik menampilkan kadar CO pada sumbu logaritmik beserta pita
 ambang batas, dan suhu/kelembapan kabin pada sumbu 0-100 dengan penanda
@@ -13,8 +14,13 @@ kondisi ekstrem. Nilai iklim mikro yang tidak valid ditampilkan sebagai celah
 pada grafik, bukan sebagai garis mendatar di nol.
 
 Pemakaian:
-    python cozero_dashboard.py --host xxxx.s1.eu.hivemq.cloud \
+    python cozero_dashboard.py
+    python cozero_dashboard.py --host broker.hivemq.com --port 1883
+    python cozero_dashboard.py --host abc123.s1.eu.hivemq.cloud \
                                --user cozero --password RAHASIA
+
+Port 8883 otomatis memakai TLS, port 1883 tanpa TLS. Username/password hanya
+dikirim bila --user diisi (broker publik tidak memerlukannya).
 
 Dependensi:
     pip install -r requirements.txt
@@ -39,11 +45,11 @@ import paho.mqtt.client as mqtt
 # ----------------------------------------------------------------------------
 # Konfigurasi default (dapat diubah melalui argumen CLI)
 # ----------------------------------------------------------------------------
-DEFAULT_HOST = "xxxxxxxxxxxx.s1.eu.hivemq.cloud"
+DEFAULT_HOST = "broker.emqx.io"
 DEFAULT_PORT = 8883
-DEFAULT_USER = "ISI_USERNAME_HIVEMQ"
-DEFAULT_PASS = "ISI_PASSWORD_HIVEMQ"
-TOPIC_BASE = "cozero/team"
+DEFAULT_USER = ""
+DEFAULT_PASS = ""
+TOPIC_BASE = "cozero/sic8-wkwk7"
 TOPIC_TELEMETRY = f"{TOPIC_BASE}/telemetry"
 TOPIC_ALERT = f"{TOPIC_BASE}/alert"
 TOPIC_STATUS = f"{TOPIC_BASE}/status"
@@ -318,10 +324,10 @@ def main():
     parser.add_argument("--no-plot", action="store_true", help="hanya log ke terminal/CSV")
     args = parser.parse_args()
 
-    if "xxxx" in args.host:
-        print("!! Argumen --host / --user / --password belum diisi dengan kredensial HiveMQ Cloud.")
-        print("   Contoh: python cozero_dashboard.py --host abc123.s1.eu.hivemq.cloud "
-              "--user cozero --password Rahasia123")
+    if not args.host or "xxxx" in args.host:
+        print("!! Argumen --host belum diisi.")
+        print("   Broker publik: python cozero_dashboard.py --host broker.emqx.io --port 8883")
+        print("   HiveMQ Cloud : tambahkan --user <user> --password <pass>")
         sys.exit(1)
 
     csv_path = args.csv or os.path.join(
@@ -332,9 +338,11 @@ def main():
     print(f"[CSV  ] Log disimpan ke: {os.path.abspath(csv_path)}")
 
     client = make_client()
-    client.username_pw_set(args.user, args.password)
-    client.tls_set(cert_reqs=ssl.CERT_NONE)
-    client.tls_insecure_set(True)
+    if args.user:
+        client.username_pw_set(args.user, args.password)
+    if args.port == 8883:
+        client.tls_set(cert_reqs=ssl.CERT_NONE)
+        client.tls_insecure_set(True)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.on_message = on_message

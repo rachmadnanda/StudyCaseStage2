@@ -22,4 +22,5 @@ Thumbs.db
 .vscode/
 .idea/
 
+*.md
 CONVERSATION_LOG.md

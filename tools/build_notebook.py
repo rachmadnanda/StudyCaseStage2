@@ -35,17 +35,22 @@ md(r"""
 **Samsung Innovation Campus Batch 8 — Stage 2 (IoT)**
 Tim Iki jenenge wes wkwk · Politeknik Negeri Malang
 
-Notebook ini berlangganan (subscribe) ke topik MQTT HiveMQ Cloud yang dipublikasikan
-oleh ESP32 (Wokwi), lalu menampilkan dashboard real-time dengan **Plotly**.
+Notebook ini berlangganan (subscribe) ke topik MQTT yang dipublikasikan oleh
+ESP32 (Wokwi) melalui **broker publik EMQX** (gratis, tanpa akun), lalu
+menampilkan dashboard real-time dengan **Plotly**.
 
 ### Alur data
-`MQ-2 → ESP32 → WiFi → HiveMQ Cloud → notebook ini → grafik`
+`MQ-2 → ESP32 → WiFi → broker MQTT → notebook ini → grafik`
 
 ### Langkah
 1. Jalankan cell **Instalasi**.
-2. Isi kredensial HiveMQ Cloud pada cell **Konfigurasi**.
+2. Periksa cell **Konfigurasi** — `MQTT_HOST`, `MQTT_PORT`, dan `TOPIC_BASE`
+   harus sama persis dengan `firmware/cozero_esp32.ino`.
 3. Jalankan cell **Koneksi** — tunggu sampai muncul `[MQTT] connected`.
 4. Jalankan cell **Dashboard live** dan nyalakan simulasi Wokwi.
+
+> Broker publik bersifat terbuka. Pastikan `TOPIC_BASE` memakai kode unik tim
+> (contoh: `cozero/sic8-wkwk7`) agar data tidak bercampur dengan pengguna lain.
 """)
 
 code(r"""
@@ -67,12 +72,18 @@ import paho.mqtt.client as mqtt
 # ============================================================
 #  KONFIGURASI — samakan dengan firmware/config di Wokwi
 # ============================================================
-MQTT_HOST = "xxxxxxxxxxxx.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USER = "ISI_USERNAME_HIVEMQ"
-MQTT_PASS = "ISI_PASSWORD_HIVEMQ"
+MQTT_HOST = "broker.emqx.io"   # broker publik gratis (EMQX)
+MQTT_PORT = 8883               # 8883 = TLS, 1883 = tanpa TLS
+MQTT_USER = ""                 # broker publik: kosongkan
+MQTT_PASS = ""                 # broker publik: kosongkan
 
-TOPIC_BASE      = "cozero/team"
+# Opsional (disarankan bila notebook dibagikan): simpan kredensial di
+# Colab Secrets (ikon kunci di sidebar kiri), bukan di dalam file .ipynb.
+# from google.colab import userdata
+# MQTT_USER = userdata.get("MQTT_USER") or ""
+# MQTT_PASS = userdata.get("MQTT_PASS") or ""
+
+TOPIC_BASE      = "cozero/sic8-wkwk7"
 TOPIC_TELEMETRY = TOPIC_BASE + "/telemetry"
 TOPIC_ALERT     = TOPIC_BASE + "/alert"
 TOPIC_STATUS    = TOPIC_BASE + "/status"
@@ -87,8 +98,8 @@ TH_RH_KERING  = 20.0      # %RH
 LEVEL_COLOR = {"AMAN": "#2e7d32", "WASPADA": "#f9a825",
                "BAHAYA": "#ef6c00", "KRITIS": "#c62828"}
 
-assert "xxxx" not in MQTT_HOST, "Kredensial MQTT_HOST / MQTT_USER / MQTT_PASS belum diisi"
-print("Konfigurasi OK ->", MQTT_HOST)
+assert MQTT_HOST and "xxxx" not in MQTT_HOST, "MQTT_HOST belum diisi"
+print(f"Konfigurasi OK -> {MQTT_HOST}:{MQTT_PORT}  topik={TOPIC_BASE}")
 """)
 
 code(r"""
@@ -106,6 +117,9 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(TOPIC_TELEMETRY, qos=1)
     client.subscribe(TOPIC_ALERT, qos=1)
     client.subscribe(TOPIC_STATUS, qos=1)
+
+def on_disconnect(client, userdata, *args):
+    print("[MQTT] terputus:", args[-1] if args else "-")
 
 def on_message(client, userdata, msg):
     payload = msg.payload.decode("utf-8", errors="replace")
@@ -157,15 +171,24 @@ def make_client():
         return mqtt.Client(client_id=cid, protocol=mqtt.MQTTv311)
 
 client = make_client()
-client.username_pw_set(MQTT_USER, MQTT_PASS)
-client.tls_set(cert_reqs=ssl.CERT_NONE)
-client.tls_insecure_set(True)
+if MQTT_USER:
+    client.username_pw_set(MQTT_USER, MQTT_PASS)
+if MQTT_PORT == 8883:
+    client.tls_set(cert_reqs=ssl.CERT_NONE)
+    client.tls_insecure_set(True)
 client.on_connect = on_connect
 client.on_message = on_message
+client.on_disconnect = on_disconnect
+client.reconnect_delay_set(min_delay=1, max_delay=5)
 
 client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
 client.loop_start()
 time.sleep(2)
+if client.is_connected():
+    print("Status: terhubung ke broker.")
+else:
+    print("Status: TIDAK terhubung. Periksa MQTT_HOST/MQTT_PORT, atau coba")
+    print("        broker.hivemq.com:8883 sebagai alternatif.")
 print("Menunggu data... (simulasi Wokwi dijalankan pada tahap ini)")
 """)
 
@@ -243,14 +266,18 @@ def render(df):
                        arrowhead=2, ay=-30, row=1, col=1)
     return fig
 
-DURASI = 90      # detik; sesuaikan dengan durasi demo
+DURASI = 600     # 10 menit; hentikan manual (tombol stop) bila rekaman selesai
 for i in range(DURASI):
     with _lock:
         data = list(rows)
 
     if len(data) < 2:
         clear_output(wait=True)
-        print(f"Menunggu data MQTT... ({i}/{DURASI})  online={status['online']}")
+        print(f"Menunggu data MQTT... ({i}/{DURASI})  online={status['online']}  "
+              f"data={len(data)}  konek={client.is_connected()}")
+        if i == 20 and not data:
+            print("\nBelum ada data masuk. Pastikan simulasi Wokwi sedang berjalan,")
+            print("tab Wokwi tidak diminimize, dan TOPIC_BASE sama dengan firmware.")
         time.sleep(1)
         continue
 

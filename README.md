@@ -5,7 +5,7 @@ Tim **Iki jenenge wes wkwk** · Politeknik Negeri Malang
 
 > Detektor karbon monoksida (CO) kabin mobil berbasis ESP32. Perangkat membaca kadar CO
 > beserta suhu dan kelembapan kabin, memberi peringatan lokal melalui OLED dan buzzer,
-> mengirim data melalui MQTT ke HiveMQ Cloud, dan menampilkannya pada dashboard Python.
+> mengirim data melalui MQTT ke broker publik (EMQX, gratis), dan menampilkannya pada dashboard Python.
 
 ---
 
@@ -27,7 +27,8 @@ StudyCaseStage2/
 ├── docs/
 │   ├── laporan.md                   ← isi laporan lengkap (sumber)
 │   ├── Laporan-CO-Zero-SIC8.docx    ← laporan siap dikumpulkan
-│   └── video-script.md              ← skrip + shot list video demo
+│   ├── video-script.md              ← skrip + shot list video demo
+│   └── video-script-dashboard.md    ← skrip khusus demo dashboard (2:30)
 └── tools/
     ├── build_laporan.py             ← menghasilkan .docx dari laporan.md
     ├── build_notebook.py            ← menghasilkan notebook Colab
@@ -61,7 +62,8 @@ INPUT / SENSING             PROCESSING / LOGIC              OUTPUT / ACTUATION
                                       | WiFi + MQTT/TLS (8883)
                                       v
                            +---------------------+
-                           |  HiveMQ Cloud       |
+                           |  Broker MQTT publik |
+                           |  broker.emqx.io     |
                            +---------------------+
                                       |
                                       | subscribe
@@ -162,13 +164,29 @@ lazim menyertai kabin tertutup dengan sirkulasi resirkulasi.
 
 ## 5. Langkah Menjalankan
 
-### 5.1 Membuat cluster HiveMQ Cloud (gratis, ±5 menit)
+### 5.1 Menyiapkan broker MQTT
 
-1. Buka <https://console.hivemq.cloud> → **Sign up** → buat cluster **Free**.
-2. Catat **Cluster URL**, contoh: `abc123def.s1.eu.hivemq.cloud`.
-3. Masuk tab **Access Management** → **Add credentials** → buat username dan password
-   dengan role *Publish & Subscribe*. Catat keduanya.
-4. Port yang dipakai ESP32 adalah **8883** (TLS).
+**Opsi A — broker publik EMQX (dipakai sebagai default, tanpa akun):**
+
+1. Tidak perlu mendaftar. Broker sudah aktif di `broker.emqx.io`.
+2. Port **8883** (TLS) dipakai firmware; port **1883** juga tersedia tanpa TLS.
+3. Broker publik terbuka untuk siapa saja, jadi **ganti `TOPIC_BASE` menjadi kode unik
+   tim**, contoh `cozero/sic8-wkwk7`. Nilai ini harus sama di firmware dan kedua dashboard.
+
+**Opsi B — HiveMQ Cloud (berbayar, bila diwajibkan):**
+
+1. Buat cluster pada <https://console.hivemq.cloud>, lalu catat **Cluster URL**.
+2. Tab **Access Management** → **Add credentials** dengan role *Publish & Subscribe*.
+3. Isi pada firmware: `MQTT_HOST`, `MQTT_USER`, `MQTT_PASS`, dan pastikan `MQTT_TLS 1`.
+
+| Broker | Host | Port | TLS | Akun |
+|---|---|---|---|---|
+| EMQX (default) | `broker.emqx.io` | 8883 / 1883 | ya / tidak | tidak perlu |
+| HiveMQ publik | `broker.hivemq.com` | 8883 / 1883 | ya / tidak | tidak perlu |
+| HiveMQ Cloud | `<cluster>.s1.eu.hivemq.cloud` | 8883 | ya | wajib |
+
+> `test.mosquitto.org` dan `mqtt.eclipseprojects.io` **tidak dipakai** karena port plain
+> 1883-nya tidak dapat dijangkau dari jaringan pengujian.
 
 ### 5.2 Membuat project Wokwi
 
@@ -180,11 +198,13 @@ lazim menyertai kabin tertutup dengan sirkulasi resirkulasi.
 3. Tab **sketch.ino** → ganti seluruh isinya dengan isi `firmware/cozero_esp32.ino`.
 4. Tambahkan file **libraries.txt** (tombol `+` pada panel file) → isi dengan isi
    `firmware/libraries.txt`.
-5. Pada `sketch.ino` bagian **KONFIGURASI**, isi kredensial:
+5. Pada `sketch.ino` bagian **KONFIGURASI**, periksa tiga nilai berikut (default sudah
+   cocok untuk broker publik):
    ```c
-   #define MQTT_HOST  "abc123def.s1.eu.hivemq.cloud"
-   #define MQTT_USER  "cozero"
-   #define MQTT_PASS  "password_cluster"
+   #define MQTT_HOST  "broker.emqx.io"
+   #define MQTT_PORT  8883
+   #define MQTT_TLS   1          // 1 = TLS, 0 = polos (port 1883)
+   #define TOPIC_BASE "cozero/sic8-wkwk7"   // ganti dengan kode unik tim
    ```
 6. Tekan ▶ **Start Simulation**, lalu buka **Serial Monitor** (baud 115200).
 
@@ -208,7 +228,7 @@ Serial Monitor akan menampilkan:
 [INFO] Kolom: KADAR_CO=ppm LEVEL_CO=status | raw=ADC V=volt d=DOUT
 [INFO] Contoh: ... | 29.0C 61.0%RH NORMAL | STATUS=KRITIS | ALASAN=CO KRITIS
 [WiFi] Menghubungkan ke Wokwi-GUEST ...
-[MQTT] Connect ke abc123def.s1.eu.hivemq.cloud:8883 ... OK
+[MQTT] Connect ke broker.emqx.io:8883 ... OK
 [  3210 ms] KADAR_CO=  0.10ppm LEVEL_CO=AMAN | raw= 843 V=0.679 d=1 | 29.0C 61.0%RH NORMAL | STATUS=AMAN | ALASAN=NORMAL
 ```
 
@@ -249,17 +269,22 @@ Perintah Serial Monitor:
 **Opsi A — Google Colab (disarankan untuk tangkapan layar):**
 1. Buka <https://colab.research.google.com> → **Upload** →
    `dashboard/cozero_dashboard_colab.ipynb`.
-2. Isi `MQTT_HOST`, `MQTT_USER`, dan `MQTT_PASS` pada cell *Konfigurasi*.
+2. Periksa cell *Konfigurasi*: `MQTT_HOST`, `MQTT_PORT`, dan `TOPIC_BASE` harus sama
+   dengan firmware. Untuk broker publik, `MQTT_USER`/`MQTT_PASS` dibiarkan kosong.
 3. Jalankan seluruh cell secara berurutan.
+
+> Bila notebook dibagikan, simpan kredensial di **Colab Secrets** (ikon kunci pada
+> sidebar kiri) dan baca dengan `google.colab.userdata`, jangan ditulis di cell.
 
 **Opsi B — lokal:**
 ```bash
 cd dashboard
 pip install -r requirements.txt
-python cozero_dashboard.py --host abc123def.s1.eu.hivemq.cloud \
-                           --user cozero --password password_cluster
+python cozero_dashboard.py                                  # broker publik, TLS
+python cozero_dashboard.py --host broker.hivemq.com --port 1883   # tanpa TLS
 ```
-Log CSV tersimpan otomatis di `data/cozero_<tanggal>.csv`.
+Untuk HiveMQ Cloud, tambahkan `--user` dan `--password`. Port 8883 otomatis memakai TLS,
+port 1883 tanpa TLS. Log CSV tersimpan otomatis di `data/cozero_<tanggal>.csv`.
 
 Dashboard menampilkan dua panel. Panel atas berisi tren CO pada sumbu logaritmik beserta
 pita ambang AMAN, WASPADA, BAHAYA, dan KRITIS. Panel bawah berisi suhu dan kelembapan
@@ -272,9 +297,9 @@ sehingga hubungan antara kondisi kabin dan kenaikan level dapat dibaca langsung.
 
 | Topik | Arah | Retain | Isi |
 |---|---|---|---|
-| `cozero/team/telemetry` | device → dashboard | tidak | data sensor tiap 2 detik |
-| `cozero/team/alert` | device → dashboard | tidak | dikirim saat level berubah |
-| `cozero/team/status` | device → dashboard | **ya** | `online` / `offline` (LWT) |
+| `cozero/<kode-tim>/telemetry` | device → dashboard | tidak | data sensor tiap 2 detik |
+| `cozero/<kode-tim>/alert` | device → dashboard | tidak | dikirim saat level berubah |
+| `cozero/<kode-tim>/status` | device → dashboard | **ya** | `online` / `offline` (LWT) |
 
 Contoh payload telemetri:
 
@@ -382,8 +407,8 @@ Alternatif lain adalah menghitung konstanta di luar simulasi dengan
 
 | Gejala | Penyebab umum | Solusi |
 |---|---|---|
-| `MQTT GAGAL (rc=-2)` | host/port salah atau TLS gagal | pastikan port **8883** dan host tanpa awalan `https://` |
-| `MQTT GAGAL (rc=4/5)` | username/password salah | buat ulang credential pada HiveMQ |
+| `MQTT GAGAL (rc=-2)` | host/port salah atau mode TLS tidak cocok | port **8883** harus `MQTT_TLS 1`, port **1883** harus `MQTT_TLS 0`; host tanpa awalan `https://` |
+| `MQTT GAGAL (rc=4/5)` | username/password salah | kosongkan `MQTT_USER`/`MQTT_PASS` untuk broker publik, atau buat ulang credential pada HiveMQ |
 | OLED blank | alamat I2C berbeda | ganti `0x3C` menjadi `0x3D` pada `oled.begin()` |
 | `[DHT] Percobaan 1/3: TIMEOUT` | jalur data DHT22 tidak merespons | firmware otomatis memindai pin lain; periksa juga ketiga kabel: `VCC→3V3`, `SDA→D4`, `GND→GND.1`, dan pastikan SDA tidak terpasang pada pad `NC` |
 | `[DHT] Sensor ditemukan pada GPIOxx dan dipakai` | kanvas Wokwi berbeda dari `diagram.json` | perangkat tetap berjalan; samakan `#define PIN_DHT` dengan nomor pin yang dilaporkan agar sesuai wiring |
@@ -396,7 +421,8 @@ Alternatif lain adalah menghitung konstanta di luar simulasi dengan
 | OLED menampilkan `--.-C  --%RH  NO DHT` | DHT22 tidak terbaca | klasifikasi iklim dilewati; ketik `dht` untuk diagnostik atau `scan` untuk mencari pin sensor |
 | Angka ppm berubah cepat lalu diam | moving average sedang menyusul nilai lama | sudah ditangani `FAST_TRACK_PPM`; kolom `i=` pada Serial menunjukkan nilai sesaat |
 | Angka ppm beku (raw identik) padahal slider digeser | AOUT MQ-2 tidak tersambung ke GPIO34 | tempelkan ulang `diagram.json`, pastikan terdapat baris `[ "mq2:AOUT", "esp:D34", "green", [] ]`, lalu **Stop → Start Simulation** |
-| MQTT nonaktif tanpa pesan `GAGAL` | `MQTT_HOST` masih placeholder `xxxx…` | isi kredensial HiveMQ; firmware mengaktifkan MQTT secara otomatis |
+| MQTT nonaktif tanpa pesan `GAGAL` | `MQTT_HOST` masih placeholder `xxxx…` | isi host broker (default `broker.emqx.io`); firmware mengaktifkan MQTT secara otomatis |
+| Data dashboard bercampur tim lain | `TOPIC_BASE` masih generik | ganti `TOPIC_BASE` menjadi kode unik tim di firmware dan kedua dashboard |
 | ppm selalu 0 | ADC terbaca 0 V (kabel AOUT lepas) | pastikan `mq2:AOUT → D34` tersambung dan periksa kolom `V=` |
 | Angka ppm jauh dari slider | skala log belum dikalibrasi | jalankan `c1 10` lalu `c2 100` (bagian 7) |
 | Level tidak pernah KRITIS | skala ppm terlalu kecil | lakukan kalibrasi (bagian 7), lalu geser slider ke 570 ppm |
@@ -424,7 +450,7 @@ pada laporan dan narasi video.
 ## 10. Checklist Sebelum Submit
 
 - [ ] Project Wokwi berjalan tanpa error dan Serial Monitor menampilkan data
-- [ ] Payload MQTT terverifikasi pada HiveMQ Web Client
+- [ ] Payload MQTT terverifikasi pada MQTT client (mis. MQTTX ke `broker.emqx.io:8883`)
 - [ ] Dashboard menampilkan grafik (tangkapan layar)
 - [ ] Minimal 3 skenario uji terisi pada `testing/test-scenarios.md`
 - [ ] Tangkapan layar `SS-01` … `SS-09` tersimpan di `docs/img/`

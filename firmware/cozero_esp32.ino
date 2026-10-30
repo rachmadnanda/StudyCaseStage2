@@ -10,7 +10,7 @@
  *  Alur sistem:
  *    MQ-2 (AOUT) --> ADC GPIO34 --> moving average --> klasifikasi level
  *        --> Buzzer + OLED (lokal, tetap jalan tanpa internet)
- *        --> WiFi --> MQTT (HiveMQ Cloud) --> Dashboard Python
+ *        --> WiFi --> MQTT (broker publik EMQX) --> Dashboard Python
  *
  *  CATATAN SIMULASI
  *    - Wokwi tidak menyediakan MQ-7. Digunakan modul MQ-2 yang juga sensitif
@@ -47,14 +47,27 @@
 #define WIFI_SSID       "Wokwi-GUEST"
 #define WIFI_PASS       ""
 
-/* --- HiveMQ Cloud (isi dengan kredensial cluster) --- */
-#define MQTT_HOST       "xxxxxxxxxxxx.s1.eu.hivemq.cloud"
+/*
+ * --- Broker MQTT ---
+ * Default di bawah memakai broker publik EMQX (gratis, tanpa akun, tanpa
+ * batas waktu). Broker publik terbuka untuk siapa saja, jadi WAJIB ganti
+ * TOPIC_BASE menjadi unik milik tim sebelum dipakai.
+ *
+ * Pilihan broker publik yang sudah diuji:
+ *   broker.emqx.io        : 8883 (TLS) / 1883  -> MQTT_TLS 1 / 0
+ *   broker.hivemq.com     : 8883 (TLS) / 1883  -> MQTT_TLS 1 / 0
+ *
+ * Kembali ke HiveMQ Cloud (berbayar): isi MQTT_HOST cluster, MQTT_PORT 8883,
+ * MQTT_USER dan MQTT_PASS dari konsol HiveMQ.
+ */
+#define MQTT_HOST       "broker.emqx.io"
 #define MQTT_PORT       8883
-#define MQTT_USER       "ISI_USERNAME_HIVEMQ"
-#define MQTT_PASS       "ISI_PASSWORD_HIVEMQ"
+#define MQTT_TLS        1        // 1 = TLS (8883), 0 = polos (1883)
+#define MQTT_USER       ""       // broker publik: biarkan kosong
+#define MQTT_PASS       ""       // broker publik: biarkan kosong
 
-/* --- Topik MQTT --- */
-#define TOPIC_BASE      "cozero/team"
+/* --- Topik MQTT (ganti bagian unik agar tidak bentrok dengan pengguna lain) --- */
+#define TOPIC_BASE      "cozero/sic8-wkwk7"
 #define TOPIC_TELEMETRY TOPIC_BASE "/telemetry"
 #define TOPIC_ALERT     TOPIC_BASE "/alert"
 #define TOPIC_STATUS    TOPIC_BASE "/status"
@@ -171,7 +184,11 @@
 
 Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 DHT dht(PIN_DHT, DHTTYPE);
+#if MQTT_TLS
 WiFiClientSecure net;
+#else
+WiFiClient net;
+#endif
 PubSubClient mqtt(net);
 
 // ==LOGIC-TYPES-BEGIN==
@@ -228,7 +245,7 @@ unsigned long bootMillis = 0;
 /* buzzer */
 bool bzState = false;
 
-/* MQTT hanya diaktifkan bila kredensial HiveMQ sudah diisi */
+/* MQTT hanya diaktifkan bila MQTT_HOST sudah diisi (bukan placeholder) */
 bool mqttConfigured = false;
 
 /* ==========================================================================
@@ -608,8 +625,14 @@ void ensureMqtt() {
   Serial.printf("[MQTT] Connect ke %s:%d ... ", MQTT_HOST, MQTT_PORT);
 
   /* Last Will & Testament: broker menandai device offline bila koneksi putus */
-  bool ok = mqtt.connect(clientId, MQTT_USER, MQTT_PASS,
-                         TOPIC_STATUS, 0, true, "{\"state\":\"offline\"}");
+  bool ok;
+  if (MQTT_USER[0] == '\0') {
+    /* Broker publik: koneksi anonim tanpa username/password */
+    ok = mqtt.connect(clientId, TOPIC_STATUS, 0, true, "{\"state\":\"offline\"}");
+  } else {
+    ok = mqtt.connect(clientId, MQTT_USER, MQTT_PASS,
+                      TOPIC_STATUS, 0, true, "{\"state\":\"offline\"}");
+  }
 
   if (ok) {
     Serial.println(F("OK"));
@@ -1129,7 +1152,9 @@ void setup() {
 
   /* Jaringan */
   ensureWifi();
+#if MQTT_TLS
   net.setInsecure();                 // penyederhanaan simulasi, lihat catatan laporan
+#endif
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setBufferSize(512);
   mqtt.setKeepAlive(30);
@@ -1141,9 +1166,10 @@ void setup() {
    */
   mqttConfigured = (strncmp(MQTT_HOST, "xxxx", 4) != 0);
   if (mqttConfigured) {
-    Serial.printf("[MQTT] Broker: %s:%d\n", MQTT_HOST, MQTT_PORT);
+    Serial.printf("[MQTT] Broker: %s:%d (%s)\n", MQTT_HOST, MQTT_PORT,
+                  MQTT_TLS ? "TLS" : "tanpa TLS");
   } else {
-    Serial.println(F("[MQTT] Kredensial HiveMQ belum diisi -> MQTT nonaktif."));
+    Serial.println(F("[MQTT] MQTT_HOST belum diisi -> MQTT nonaktif."));
     Serial.println(F("[MQTT] Fitur lokal (OLED/buzzer) tetap berjalan."));
   }
 }
